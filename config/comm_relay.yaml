@@ -1,0 +1,26 @@
+comm_relay:
+  ros__parameters:
+    # Source topic, published by scout2map_event (S2M-Event-Engine)
+    events_topic: /events
+
+    # Custom WebSocket server, NOT rosbridge - one-way JSON push to
+    # Web-Monitoring with connect/disconnect buffering. Bind 0.0.0.0 so the
+    # local AP can reach it from the operator's laptop.
+    ws_host: 0.0.0.0
+    ws_port: 9091
+
+    # Buffer bounds while no web client is connected. Oldest entries are
+    # dropped first once either bound is hit; the client is told how many
+    # were dropped on reconnect.
+    buffer_max_len: 500
+    buffer_max_age_s: 1800.0
+
+    # Local ROS heartbeat of relay/link health, independent of whether any
+    # web client is currently attached (std_msgs/String, JSON)
+    link_status_topic: /relay/link_status
+    link_status_period_s: 2.0
+
+    # websockets library keepalive, catches half-open TCP connections
+    # (Wi-Fi roams, AP hiccups) faster than waiting for a send to fail
+    ws_ping_interval_s: 10.0
+    ws_ping_timeout_s: 10.0

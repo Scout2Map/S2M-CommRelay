@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>scout2map_comm</name>
+  <version>0.1.0</version>
+  <description>Communication relay for Scout2Map. Buffers the event engine's
+  /events across Web-Monitoring link outages and replays them in order once
+  a client reconnects, over a lightweight custom WebSocket protocol.</description>
+  <maintainer email="jihoonkim.tech@gmail.com">jihoonkim</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <!-- If rosdep can't resolve this key on your distro, pip install it
+       instead: pip install websockets --break-system-packages -->
+  <depend>python3-websockets</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
