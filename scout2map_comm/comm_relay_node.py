@@ -68,9 +68,9 @@ class CommRelayNode(Node):
         self._dropped_count = 0
         self._seq = 0
 
-        self._clients = set()
+        self._ws_clients = set()
         # One asyncio.Lock per connected client, guarded by self._buffer_lock
-        # alongside self._clients. Every send to a client goes through
+        # alongside self._ws_clients. Every send to a client goes through
         # _send_frames() so a multi-frame send (map meta + binary payload)
         # can never be interleaved with an unrelated event broadcast on the
         # same socket.
@@ -149,7 +149,7 @@ class CommRelayNode(Node):
             self._buffer.clear()
             dropped = self._dropped_count
             self._dropped_count = 0
-            self._clients.add(websocket)
+            self._ws_clients.add(websocket)
             self._client_locks[websocket] = asyncio.Lock()
             self._link_state = 'ok'
 
@@ -189,9 +189,9 @@ class CommRelayNode(Node):
             self.get_logger().warning(f'client session ended with error: {exc}')
         finally:
             with self._buffer_lock:
-                self._clients.discard(websocket)
+                self._ws_clients.discard(websocket)
                 self._client_locks.pop(websocket, None)
-                if not self._clients:
+                if not self._ws_clients:
                     self._last_client_seen_mono = time.monotonic()
                     self._link_state = 'lost'
 
@@ -209,7 +209,7 @@ class CommRelayNode(Node):
 
     async def _broadcast(self, envelope):
         with self._buffer_lock:
-            clients = list(self._clients)
+            clients = list(self._ws_clients)
         if not clients:
             return
         results = await asyncio.gather(
@@ -217,7 +217,7 @@ class CommRelayNode(Node):
         for client, result in zip(clients, results):
             if isinstance(result, Exception):
                 with self._buffer_lock:
-                    self._clients.discard(client)
+                    self._ws_clients.discard(client)
                     self._client_locks.pop(client, None)
 
     async def _broadcast_map(self):
@@ -228,7 +228,7 @@ class CommRelayNode(Node):
             payload = self._latest_map_bytes
 
         with self._buffer_lock:
-            clients = list(self._clients)
+            clients = list(self._ws_clients)
         if not clients:
             return
         results = await asyncio.gather(
@@ -237,7 +237,7 @@ class CommRelayNode(Node):
         for client, result in zip(clients, results):
             if isinstance(result, Exception):
                 with self._buffer_lock:
-                    self._clients.discard(client)
+                    self._ws_clients.discard(client)
                     self._client_locks.pop(client, None)
 
     # --- ROS side (executor thread) ---
@@ -265,7 +265,7 @@ class CommRelayNode(Node):
         seq = self._next_seq()
 
         with self._buffer_lock:
-            has_clients = bool(self._clients)
+            has_clients = bool(self._ws_clients)
 
         if has_clients:
             envelope = self._wrap(msg.data, replay=False, wall_ts=wall_ts, seq=seq)
@@ -344,7 +344,7 @@ class CommRelayNode(Node):
     def _publish_status(self):
         with self._buffer_lock:
             state = self._link_state
-            client_count = len(self._clients)
+            client_count = len(self._ws_clients)
             buffered = len(self._buffer)
             dropped = self._dropped_count
             offline_s = (
