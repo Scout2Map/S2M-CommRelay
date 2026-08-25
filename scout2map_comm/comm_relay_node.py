@@ -6,6 +6,7 @@
 import asyncio
 import json
 import math
+import subprocess
 import threading
 import time
 import zlib
@@ -15,7 +16,10 @@ import rclpy
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import BatteryState
+from scout2map_msgs.msg import DriveStatus
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 import tf2_ros
 
@@ -54,6 +58,10 @@ class CommRelayNode(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('pose_relay_period_s', 0.1)
 
+        # Drive Status & Battery topics
+        self.declare_parameter('battery_topic', '/drive/battery')
+        self.declare_parameter('drive_status_topic', '/drive/status')
+
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
         self._ws_port = int(self.get_parameter('ws_port').value)
@@ -70,6 +78,13 @@ class CommRelayNode(Node):
         self._map_frame = self.get_parameter('map_frame').value
         self._base_frame = self.get_parameter('base_frame').value
         self._pose_relay_period_s = float(self.get_parameter('pose_relay_period_s').value)
+
+        self._battery_topic = self.get_parameter('battery_topic').value
+        self._drive_status_topic = self.get_parameter('drive_status_topic').value
+
+        # Subprocess handlers for missions
+        self._explore_process = None
+        self._return_home_process = None
 
         # Buffer entries: (monotonic_ts, wall_ts, seq, raw_json_str)
         # Held only while no web client is connected; see README for the
@@ -105,6 +120,18 @@ class CommRelayNode(Node):
         self._status_pub = self.create_publisher(String, self._link_status_topic, 10)
         self._sub = self.create_subscription(
             String, self._events_topic, self._on_event, 50)
+
+        # Drive Telemetry Subscriptions (/drive/battery, /drive/status)
+        self._battery_sub = self.create_subscription(
+            BatteryState, self._battery_topic, self._on_battery, 10)
+        self._drive_status_sub = self.create_subscription(
+            DriveStatus, self._drive_status_topic, self._on_drive_status, 10)
+
+        # ROS 2 Service Clients for Drive Controls
+        self._cli_estop = self.create_client(Trigger, '/drive/estop')
+        self._cli_clear_fault = self.create_client(Trigger, '/drive/clear_fault')
+        self._cli_reset_odom = self.create_client(Trigger, '/drive/reset_odom')
+
         # Map publishers (slam_toolbox, nav2 map_server) typically latch the
         # last map with TRANSIENT_LOCAL durability - match it, otherwise a
         # relay started after the last publish would wait for the next one.
@@ -196,9 +223,9 @@ class CommRelayNode(Node):
             if latest_meta is not None:
                 await self._send_frames(websocket, [json.dumps(latest_meta), latest_bytes])
 
-            async for _ in websocket:
-                # One-way relay (SBC -> web); inbound frames are ignored.
-                pass
+            # Process Inbound Websocket Messages (Commands from Web Monitoring)
+            async for raw_inbound in websocket:
+                await self._handle_inbound_message(raw_inbound)
 
         except (ConnectionClosed, OSError):
             pass
@@ -211,6 +238,90 @@ class CommRelayNode(Node):
                 if not self._ws_clients:
                     self._last_client_seen_mono = time.monotonic()
                     self._link_state = 'lost'
+
+    async def _handle_inbound_message(self, raw_msg):
+        """Web UI로부터 들어온 command 수신 처리"""
+        try:
+            msg = json.loads(raw_msg)
+            if msg.get('kind') != 'command':
+                return
+
+            cmd = msg.get('command')
+            self.get_logger().info(f'Received Web Command: {cmd}')
+
+            # drive control commands (/drive/estop, /drive/clear_fault, /drive/reset_odom)
+            if cmd == 'estop':
+                self._call_trigger_service(self._cli_estop, 'E-Stop (/drive/estop)')
+            elif cmd == 'clear_fault':
+                self._call_trigger_service(self._cli_clear_fault, 'Clear Fault (/drive/clear_fault)')
+            elif cmd == 'reset_odom':
+                self._call_trigger_service(self._cli_reset_odom, 'Reset Odom (/drive/reset_odom)')
+
+            # start mission control commands (launch_mission, stop_mission)
+            elif cmd == 'launch_mission':
+                mission = msg.get('mission')
+                if mission == 'explore':
+                    self._start_explore_mission()
+                elif mission == 'return_home':
+                    self._start_return_mission()
+
+            # end mission control commands (launch_mission, stop_mission)
+            elif cmd == 'stop_mission':
+                mission = msg.get('mission')
+                if mission == 'explore':
+                    self._stop_explore_mission()
+                elif mission == 'return_home':
+                    self._stop_return_mission()
+
+        except Exception as exc:
+            self.get_logger().error(f'Error processing inbound websocket message: {exc}')
+
+    def _call_trigger_service(self, client, name):
+        if not client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(f'Service {name} is not available!')
+            return
+
+        req = Trigger.Request()
+        client.call_async(req)
+        self.get_logger().info(f'Successfully triggered service: {name}')
+
+    def _start_explore_mission(self):
+        if self._explore_process and self._explore_process.poll() is None:
+            self.get_logger().warn('Explore mission is already running!')
+            return
+        self._explore_process = subprocess.Popen(
+            ['ros2', 'launch', 'explore_lite', 'explore.launch.py']
+        )
+        self.get_logger().info('Launched explore_lite mission')
+        self._broadcast_mission_status('EXPLORE')
+
+    def _stop_explore_mission(self):
+        if self._explore_process and self._explore_process.poll() is None:
+            self._explore_process.terminate()
+            self._explore_process = None
+            self.get_logger().info('Terminated explore_lite mission')
+        self._broadcast_mission_status('IDLE')
+
+    def _start_return_mission(self):
+        if self._return_home_process and self._return_home_process.poll() is None:
+            self.get_logger().warn('Return Home mission is already running!')
+            return
+        self._return_home_process = subprocess.Popen(
+            ['ros2', 'launch', 's2m_bringup', 's2m_return_home_real.launch.py']
+        )
+        self.get_logger().info('Launched s2m_return_home_real mission')
+        self._broadcast_mission_status('RETURN')
+
+    def _stop_return_mission(self):
+        if self._return_home_process and self._return_home_process.poll() is None:
+            self._return_home_process.terminate()
+            self._return_home_process = None
+            self.get_logger().info('Terminated s2m_return_home_real mission')
+        self._broadcast_mission_status('IDLE')
+
+    def _broadcast_mission_status(self, status):
+        msg = json.dumps({'kind': 'mission_status', 'mission': status})
+        asyncio.run_coroutine_threadsafe(self._broadcast(msg), self._loop)
 
     async def _send_frames(self, client, frames):
         # Sends every frame in the list under that client's own lock, so a
@@ -258,6 +369,52 @@ class CommRelayNode(Node):
                     self._client_locks.pop(client, None)
 
     # --- ROS side (executor thread) ---
+
+    def _on_battery(self, msg: BatteryState):
+        """sensor_msgs/msg/BatteryState 토픽 콜백 -> WebSocket 전송"""
+        try:
+            # BatteryState.percentage는 0.0 ~ 1.0 범위이므로 퍼센트(%)로 환산
+            percentage = round(msg.percentage * 100.0, 1) if not math.isnan(msg.percentage) else 0.0
+            voltage = round(float(msg.voltage), 2) if not math.isnan(msg.voltage) else 0.0
+
+            # battery warning level setting (Dead, Warning, Normal)
+            warning_level = 'Normal'
+            if percentage <= 10.0:
+                warning_level = 'Dead'
+            elif percentage <= 20.0:
+                warning_level = 'Warning'
+
+            payload = json.dumps({
+                'kind': 'drive_battery',
+                'data': {
+                    'percentage': percentage,
+                    'voltage': voltage,
+                    'warning_level': warning_level,
+                }
+            })
+            asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+        except Exception as exc:
+            self.get_logger().error(f'Error parsing /drive/battery msg: {exc}')
+
+    def _on_drive_status(self, msg: DriveStatus):
+        """scout2map_msgs/msg/DriveStatus 토픽 콜백 -> WebSocket 전송"""
+        try:
+            payload = json.dumps({
+                'kind': 'drive_status',
+                'data': {
+                    'link_ok': msg.link_ok,
+                    'mcu_reboot_count': msg.mcu_reboot_count,
+                    'cmd_timeout': msg.cmd_timeout,
+                    'frames_ok': msg.frames_ok,
+                    'crc_errors': msg.crc_errors,
+                    'batt_warn': msg.batt_warn,
+                    'batt_critical': msg.batt_critical,
+                    'batt_dead': msg.batt_dead,
+                }
+            })
+            asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+        except Exception as exc:
+            self.get_logger().error(f'Error parsing /drive/status msg: {exc}')
 
     def _broadcast_robot_pose(self):
         with self._buffer_lock:
