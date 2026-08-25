@@ -17,6 +17,8 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
+import tf2_ros
+
 try:
     import websockets
     # Import the submodule explicitly - some websockets versions (17+) do not
@@ -47,6 +49,11 @@ class CommRelayNode(Node):
         self.declare_parameter('map_relay_period_s', 2.0)
         self.declare_parameter('map_zlib_level', 6)
 
+        # Robot Pose parameters
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('pose_relay_period_s', 0.1)
+
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
         self._ws_port = int(self.get_parameter('ws_port').value)
@@ -59,6 +66,10 @@ class CommRelayNode(Node):
         self._map_topic = self.get_parameter('map_topic').value
         self._map_relay_period_s = float(self.get_parameter('map_relay_period_s').value)
         self._map_zlib_level = int(self.get_parameter('map_zlib_level').value)
+
+        self._map_frame = self.get_parameter('map_frame').value
+        self._base_frame = self.get_parameter('base_frame').value
+        self._pose_relay_period_s = float(self.get_parameter('pose_relay_period_s').value)
 
         # Buffer entries: (monotonic_ts, wall_ts, seq, raw_json_str)
         # Held only while no web client is connected; see README for the
@@ -87,6 +98,10 @@ class CommRelayNode(Node):
         self._map_dirty = False
         self._map_seq = 0
 
+        # TF Listener setup for Robot Pose
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
         self._status_pub = self.create_publisher(String, self._link_status_topic, 10)
         self._sub = self.create_subscription(
             String, self._events_topic, self._on_event, 50)
@@ -104,6 +119,8 @@ class CommRelayNode(Node):
             self._link_status_period_s, self._publish_status)
         self._map_timer = self.create_timer(
             self._map_relay_period_s, self._maybe_broadcast_map)
+        self._pose_timer = self.create_timer(
+            self._pose_relay_period_s, self._broadcast_robot_pose)
 
         # The websocket server runs its own asyncio loop on a background
         # thread so it never blocks rclpy.spin() on the main thread.
@@ -241,6 +258,37 @@ class CommRelayNode(Node):
                     self._client_locks.pop(client, None)
 
     # --- ROS side (executor thread) ---
+
+    def _broadcast_robot_pose(self):
+        with self._buffer_lock:
+            if not self._ws_clients:
+                return
+
+        try:
+            now = rclpy.time.Time()
+            transform = self._tf_buffer.lookup_transform(
+                self._map_frame,
+                self._base_frame,
+                now,
+                timeout=rclpy.duration.Duration(seconds=0.05)
+            )
+
+            tx = transform.transform.translation.x
+            ty = transform.transform.translation.y
+            q = transform.transform.rotation
+            yaw = self._yaw_from_quaternion(q)
+
+            pose_msg = json.dumps({
+                'kind': 'pose',
+                'x': tx,
+                'y': ty,
+                'yaw': yaw
+            })
+
+            asyncio.run_coroutine_threadsafe(self._broadcast(pose_msg), self._loop)
+
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+            pass
 
     def _next_seq(self):
         with self._buffer_lock:
