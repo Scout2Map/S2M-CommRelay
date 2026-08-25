@@ -13,7 +13,8 @@
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
   <!-- If rosdep can't resolve this key on your distro, pip install it
-       instead: pip install websockets --break-system-packages -->
+       instead: pip install websockets (add the break system packages flag
+       on Debian/Ubuntu managed-Python installs) -->
   <depend>python3-websockets</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
