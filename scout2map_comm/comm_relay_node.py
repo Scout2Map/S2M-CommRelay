@@ -61,6 +61,7 @@ class CommRelayNode(Node):
         # Drive Status & Battery topics
         self.declare_parameter('battery_topic', '/drive/battery')
         self.declare_parameter('drive_status_topic', '/drive/status')
+        self.declare_parameter('telemetry_relay_period_s', 10.0)
 
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
@@ -81,6 +82,11 @@ class CommRelayNode(Node):
 
         self._battery_topic = self.get_parameter('battery_topic').value
         self._drive_status_topic = self.get_parameter('drive_status_topic').value
+        self._telemetry_relay_period_s = float(self.get_parameter('telemetry_relay_period_s').value)
+        
+        self._telemetry_lock = threading.Lock()
+        self._latest_battery_payload = None
+        self._latest_drive_status_payload = None
 
         # Subprocess handlers for missions
         self._explore_process = None
@@ -148,6 +154,8 @@ class CommRelayNode(Node):
             self._map_relay_period_s, self._maybe_broadcast_map)
         self._pose_timer = self.create_timer(
             self._pose_relay_period_s, self._broadcast_robot_pose)
+        self._telemetry_timer = self.create_timer(
+            self._telemetry_relay_period_s, self._broadcast_telemetry)
 
         # The websocket server runs its own asyncio loop on a background
         # thread so it never blocks rclpy.spin() on the main thread.
@@ -371,13 +379,11 @@ class CommRelayNode(Node):
     # --- ROS side (executor thread) ---
 
     def _on_battery(self, msg: BatteryState):
-        """sensor_msgs/msg/BatteryState 토픽 콜백 -> WebSocket 전송"""
+        """sensor_msgs/msg/BatteryState 토픽 콜백 -> 최신 데이터 저장"""
         try:
-            # BatteryState.percentage는 0.0 ~ 1.0 범위이므로 퍼센트(%)로 환산
             percentage = round(msg.percentage * 100.0, 1) if not math.isnan(msg.percentage) else 0.0
             voltage = round(float(msg.voltage), 2) if not math.isnan(msg.voltage) else 0.0
 
-            # battery warning level setting (Dead, Warning, Normal)
             warning_level = 'Normal'
             if percentage <= 10.0:
                 warning_level = 'Dead'
@@ -392,12 +398,13 @@ class CommRelayNode(Node):
                     'warning_level': warning_level,
                 }
             })
-            asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+            with self._telemetry_lock:
+                self._latest_battery_payload = payload
         except Exception as exc:
             self.get_logger().error(f'Error parsing /drive/battery msg: {exc}')
 
     def _on_drive_status(self, msg: DriveStatus):
-        """scout2map_msgs/msg/DriveStatus 토픽 콜백 -> WebSocket 전송"""
+        """scout2map_msgs/msg/DriveStatus 토픽 콜백 -> 최신 데이터 저장"""
         try:
             payload = json.dumps({
                 'kind': 'drive_status',
@@ -412,7 +419,8 @@ class CommRelayNode(Node):
                     'batt_dead': msg.batt_dead,
                 }
             })
-            asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+            with self._telemetry_lock:
+                self._latest_drive_status_payload = payload
         except Exception as exc:
             self.get_logger().error(f'Error parsing /drive/status msg: {exc}')
 
@@ -446,6 +454,23 @@ class CommRelayNode(Node):
 
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
             pass
+        
+    def _broadcast_telemetry(self):
+        """설정한 주기마다 최신 배터리 및 드라이브 상태를 주기적으로 브로드캐스트"""
+        with self._buffer_lock:
+            if not self._ws_clients:
+                return
+
+        with self._telemetry_lock:
+            batt_payload = self._latest_battery_payload
+            status_payload = self._latest_drive_status_payload
+            self._latest_battery_payload = None
+            self._latest_drive_status_payload = None
+
+        if batt_payload:
+            asyncio.run_coroutine_threadsafe(self._broadcast(batt_payload), self._loop)
+        if status_payload:
+            asyncio.run_coroutine_threadsafe(self._broadcast(status_payload), self._loop)
 
     def _next_seq(self):
         with self._buffer_lock:
