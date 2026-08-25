@@ -11,7 +11,9 @@
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
-  <!-- if rosdep fails, use pip install websockets break-system-packages -->
+  <depend>nav_msgs</depend>
+  <!-- If rosdep can't resolve this key on your distro, pip install it
+       instead: pip install websockets --break-system-packages -->
   <depend>python3-websockets</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>

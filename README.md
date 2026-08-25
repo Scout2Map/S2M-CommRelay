@@ -4,7 +4,7 @@ Scout2Map의 통신 중계 레이어다. `S2M-Event-Engine`이 발행하는 `/ev
 
 rosbridge_suite를 쓰지 않는다. rosbridge는 pub/sub을 WebSocket으로 중계만 할 뿐 끊긴 동안의 메시지를 들고 있다가 재전송하는 기능이 없어서, 이벤트처럼 "놓치면 안 되는" 데이터에는 맞지 않다. 대신 `comm_relay_node`가 자체 WebSocket 프로토콜로 버퍼링·재전송·연결 상태 보고까지 직접 처리한다.
 
-SLAM 지도나 raw 센서 스트림처럼 "최신 값만 중요하고 끊겨도 다시 받으면 그만"인 데이터는 이 레포의 스코프가 아니다. 그런 최선형(best-effort) 스트림은 나중에 rosbridge_websocket 기반으로 별도 launch profile을 추가해서 처리할 계획이며, 지금은 포함되어 있지 않다.
+`/map`(nav_msgs/OccupancyGrid)도 같은 노드, 같은 WebSocket 연결로 함께 relay한다. rosbridge를 별도로 안 두고 통일하기로 했다 — 다만 지도는 이벤트와 성격이 달라서(최신 값만 중요하고 끊겨도 다시 받으면 그만) **버퍼링은 하지 않는다.** 대신 대역폭을 아끼려고 zlib 압축 + 주기 제한(throttle)을 건다. raw 센서 스트림은 아직 스코프 밖이다.
 
 ## 아키텍처
 
@@ -14,7 +14,9 @@ S2M-Event-Engine                 S2M-CommRelay                  Web-Monitoring
                                   ├─ 클라이언트 연결됨 → 즉시 전달
                                   ├─ 클라이언트 없음   → 버퍼에 적재
                                   └─ 재연결 시         → 버퍼 순서대로 재전송
-                                       │
+SLAM/AMCL                                │
+  /map (OccupancyGrid)   ──►            │  (버퍼링 없음, latest-wins,
+                                         │   zlib 압축 + 주기 제한)
                                        ▼
                                 ws://<sbc-ip>:9091  ──────────►  new WebSocket(...)
                                 /relay/link_status (String, JSON, 로컬 ROS 헤르트비트)
@@ -56,6 +58,26 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 ```
 `replay: true`면 끊긴 동안 쌓였다가 재전송된 것, `false`면 실시간으로 온 것 — 프론트에서 "밀린 알림"과 "지금 막 온 알림"을 구분해서 표시하고 싶을 때 이 필드를 쓰면 된다.
 
+**지도 (JSON 메타 프레임 + 곧바로 이어지는 바이너리 프레임, 총 2개가 한 쌍):**
+```json
+{
+  "kind": "map_meta",
+  "seq": 42,
+  "encoding": "zlib-int8-rowmajor-bottomleft",
+  "resolution": 0.05,
+  "width": 400,
+  "height": 400,
+  "origin": { "x": -10.0, "y": -10.0, "yaw": 0.0 },
+  "raw_bytes": 160000,
+  "compressed_bytes": 3421
+}
+```
+이 프레임 바로 다음에 오는 바이너리 프레임이 실제 그리드 데이터다: `nav_msgs/OccupancyGrid.data`(int8, 값은 `-1`/`0`..`100`)를 부호 없는 바이트로 그대로 담고(`byte = value & 0xFF`, 즉 `-1` → `255`) zlib(RFC1950, `zlib.compress()`)로 압축한 것. 순서는 ROS 관례대로 row-major, row 0이 지도 좌표계의 아래쪽(가장 작은 y)이다. 클라이언트는 `DecompressionStream('deflate')`로 풀고, 각 바이트를 `byte > 127 ? byte - 256 : byte`로 되돌리면 원래 값이 나온다.
+
+버퍼링 대상이 아니므로 클라이언트가 접속하는 순간 최신 지도가 있으면(있다면) 바로 이 쌍을 한 번 보내주고, 그 뒤로는 `map_relay_period_s`마다(그 사이에 새 지도가 왔을 때만) 다시 보낸다.
+
+**알려진 단순화**: `origin`의 회전(yaw)은 프레임에 실어 보내지만, 지금 프론트(`S2M-Web-Monitoring`의 `MapView`)는 회전이 0이라고 가정하고 위치 오프셋만 반영한다. 실제 SLAM 결과 대부분이 origin 회전 없이 나오기 때문에 내린 단순화이며, 만약 origin이 회전되어 있으면 `comm_relay_node`가 ROS 로그에 경고를 남긴다.
+
 ## 프론트엔드 최소 예시
 
 ```javascript
@@ -82,6 +104,9 @@ ws.onmessage = (ev) => {
 | `link_status_topic` | `/relay/link_status` | 로컬 ROS 연결 상태 헤르트비트 |
 | `link_status_period_s` | `2.0` | 헤르트비트 발행 주기 |
 | `ws_ping_interval_s` / `ws_ping_timeout_s` | `10.0` / `10.0` | WebSocket keepalive (반쯤 끊긴 연결 빨리 감지) |
+| `map_topic` | `/map` | 구독할 지도 토픽 (nav_msgs/OccupancyGrid) |
+| `map_relay_period_s` | `2.0` | 지도를 이 주기보다 자주 다시 보내지 않음 (대역폭 절약, 새 지도가 없으면 아예 안 보냄) |
+| `map_zlib_level` | `6` | 그리드 압축 레벨 (0-9). 필요하면 9까지 올려서 대역폭을 더 줄일 수 있음 |
 
 ## 빌드 & 실행
 
@@ -101,14 +126,17 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - 수동 확인: `event_engine`을 같이 띄운 상태에서 브라우저 콘솔이나 `wscat -c ws://<sbc-ip>:9091`로 접속해서 `status` 프레임이 오는지, 온도 임계값을 넘겨서 실제 `event` 프레임이 오는지 확인
 - 버퍼링 확인: 클라이언트를 끊고(브라우저 탭 닫기 등) 그 사이 이벤트를 몇 개 발생시킨 뒤 재접속 → `status`의 `buffered_count`와 실제로 온 `event` 프레임 개수가 맞는지, `replay: true`로 표시되는지 확인
 - `ros2 topic echo /relay/link_status`로 로컬에서도 연결 상태를 볼 수 있다
+- 지도 확인: SLAM/AMCL을 같이 띄운 상태에서 `ros2 topic hz /map`으로 실제 발행되는지 먼저 확인하고, 웹 화면에서 지도가 뜨는지, 로그에 `web client connected`가 찍힌 직후 최신 지도가 바로 오는지(재접속 시 다음 주기까지 안 기다리는지), `map_relay_period_s`보다 SLAM이 더 자주 갱신해도 릴레이는 그 주기로만 나가는지 확인
 
 ## 알려진 제한사항
 
 - **단일 논리 소비자를 가정한다.** 클라이언트가 1개 이상 붙어있으면 그 순간부터는 버퍼링을 하지 않는다. 관제 화면을 여러 개 동시에 열어두면, 나중에 접속한 두 번째 탭은 첫 번째 탭이 이미 받은 과거 이벤트를 재전송받지 못한다. 지금 단계는 "관제 1곳"을 전제로 한 설계다.
 - **버퍼 전달과 clear 사이에 아주 작은 유실 창이 있다.** 클라이언트 접속 직후 버퍼를 비우고 전송을 시작하는데, 전송 도중 그 클라이언트가 바로 끊기면 아직 못 보낸 나머지는 유실된다(다음 재연결에 다시 안 옴). 단일 운영자 테스트 도구 수준에서는 감수 가능한 트레이드오프로 판단했다.
 - **인증/암호화가 없다.** 지금은 현장 로컬 Wi-Fi/AP 안에서만 쓰는 걸 전제로 한다. 인터넷 경유로 확장하게 되면 이 앞단에 반드시 TLS(WSS)와 토큰 인증을 붙여야 한다.
+- **지도 origin 회전을 반영하지 않는다.** `origin.yaw`가 0이 아니면 프론트 마커 위치가 틀어진다. 그런 지도가 나오면 로그에 경고가 찍히니, 그때 가서 좌표 변환에 회전을 반영하면 된다.
 
 ## 로드맵 (스코프 밖, 참고용)
 
-- `/map` (nav_msgs/OccupancyGrid), raw 센서 스트림 — best-effort라 버퍼링 불필요, rosbridge_websocket 기반 별도 launch profile로 추가 예정
+- raw 센서 스트림 relay
 - 멀티 클라이언트 지원이 필요해지면 클라이언트별 커서(마지막으로 받은 `seq`) 추적으로 확장
+- 지도 origin 회전 반영 (지금은 회전 없다고 가정)

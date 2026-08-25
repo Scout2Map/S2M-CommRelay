@@ -24,3 +24,21 @@ comm_relay:
     # (Wi-Fi roams, AP hiccups) faster than waiting for a send to fail
     ws_ping_interval_s: 10.0
     ws_ping_timeout_s: 10.0
+
+    # /map is best-effort (latest wins) - unlike /events it is NOT buffered
+    # while no client is connected, only the most recent grid is kept and
+    # handed to whoever connects next.
+    map_topic: /map
+
+    # Occupancy grids are much bigger than an event and don't need to be
+    # fresh to the second, so we only relay the latest one at most this
+    # often even if SLAM republishes faster. Raise this if the map still
+    # feels like too much bandwidth on a weak AP link.
+    map_relay_period_s: 2.0
+
+    # zlib compression level (0-9) applied to the grid bytes before sending.
+    # Occupancy grids are mostly runs of the same value (-1/0/100) so this
+    # typically shrinks them a lot; 6 is zlib's own default (good ratio
+    # without burning much CPU on the Pi). Raise toward 9 if bandwidth still
+    # hurts and the Pi has CPU to spare, lower toward 1 if it's the reverse.
+    map_zlib_level: 6
