@@ -311,6 +311,11 @@ class CommRelayNode(Node):
             self._explore_process.terminate()
             self._explore_process = None
             self.get_logger().info('Terminated explore_lite mission')
+
+        # send zero velocity to cancel active momentum and stop immediately
+        stop_cmd = Twist()
+        self._stop_pub.publish(stop_cmd)
+
         self._broadcast_mission_status('IDLE')
 
     def _start_return_mission(self):
