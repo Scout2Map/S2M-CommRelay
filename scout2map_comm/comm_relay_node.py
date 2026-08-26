@@ -13,6 +13,7 @@ import zlib
 from collections import deque
 
 import rclpy
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
