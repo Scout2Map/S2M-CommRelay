@@ -19,7 +19,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import BatteryState
 from scout2map_msgs.msg import DriveStatus
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 import tf2_ros
 
@@ -88,9 +88,8 @@ class CommRelayNode(Node):
         self._latest_battery_payload = None
         self._latest_drive_status_payload = None
 
-        # Subprocess handlers for missions
+        # Subprocess handler for exploration mission
         self._explore_process = None
-        self._return_home_process = None
 
         # Buffer entries: (monotonic_ts, wall_ts, seq, raw_json_str)
         # Held only while no web client is connected; see README for the
@@ -137,6 +136,10 @@ class CommRelayNode(Node):
         self._cli_estop = self.create_client(Trigger, '/drive/estop')
         self._cli_clear_fault = self.create_client(Trigger, '/drive/clear_fault')
         self._cli_reset_odom = self.create_client(Trigger, '/drive/reset_odom')
+
+        # ROS 2 Service Clients for Return-Home Controls
+        self._cli_return_trigger = self.create_client(Trigger, '/return_home/trigger')
+        self._cli_return_arm = self.create_client(SetBool, '/return_home/arm')
 
         # Map publishers (slam_toolbox, nav2 map_server) typically latch the
         # last map with TRANSIENT_LOCAL durability - match it, otherwise a
@@ -311,21 +314,49 @@ class CommRelayNode(Node):
         self._broadcast_mission_status('IDLE')
 
     def _start_return_mission(self):
-        if self._return_home_process and self._return_home_process.poll() is None:
-            self.get_logger().warn('Return Home mission is already running!')
+        # call trigger service on the active return_home node
+        if not self._cli_return_trigger.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn('Return home trigger service (/return_home/trigger) is not available!')
             return
-        self._return_home_process = subprocess.Popen(
-            ['ros2', 'launch', 's2m_bringup', 's2m_return_home_real.launch.py']
-        )
-        self.get_logger().info('Launched s2m_return_home_real mission')
-        self._broadcast_mission_status('RETURN')
+
+        req = Trigger.Request()
+        future = self._cli_return_trigger.call_async(req)
+        
+        # handle service response callback
+        def _on_trigger_done(f):
+            try:
+                res = f.result()
+                if res.success:
+                    self.get_logger().info(f'Return home service triggered: {res.message}')
+                    self._broadcast_mission_status('RETURN')
+                else:
+                    self.get_logger().warn(f'Return home service rejected: {res.message}')
+            except Exception as exc:
+                self.get_logger().error(f'Return home service call failed: {exc}')
+
+        future.add_done_callback(_on_trigger_done)
 
     def _stop_return_mission(self):
-        if self._return_home_process and self._return_home_process.poll() is None:
-            self._return_home_process.terminate()
-            self._return_home_process = None
-            self.get_logger().info('Terminated s2m_return_home_real mission')
-        self._broadcast_mission_status('IDLE')
+        # disarm return_home node to cancel active return goal and trigger safe stop
+        if not self._cli_return_arm.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn('Return home arm service (/return_home/arm) is not available!')
+            return
+
+        req = SetBool.Request()
+        req.data = False
+        future = self._cli_return_arm.call_async(req)
+
+        # handle disarm response callback
+        def _on_arm_done(f):
+            try:
+                res = f.result()
+                self.get_logger().info(f'Return home disarmed: {res.message}')
+            except Exception as exc:
+                self.get_logger().error(f'Return home disarm call failed: {exc}')
+            finally:
+                self._broadcast_mission_status('IDLE')
+
+        future.add_done_callback(_on_arm_done)
 
     def _broadcast_mission_status(self, status):
         msg = json.dumps({'kind': 'mission_status', 'mission': status})
