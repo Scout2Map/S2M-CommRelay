@@ -1,6 +1,6 @@
 # S2M-CommRelay
 
-Scout2Map의 통신 중계 레이어다. `S2M-Event-Engine`이 발행하는 `/events`를 Web-Monitoring 쪽으로 넘기되, **네트워크가 끊겼다가 다시 붙어도 그 사이에 놓친 이벤트가 유실되지 않도록** 버퍼링하는 게 이 레포의 핵심 역할이다. 여기에 더해 SLAM 지도, 로봇 위치(pose), 배터리/하드웨어 텔레메트리를 같은 연결로 함께 relay하고, 웹에서 들어오는 드라이브·미션 제어 명령을 ROS2로 중계한다.
+**Scout2Map** — 다중 센서 기반 환경 적응형 정찰 UGV의 통신 중계 레이어다. `S2M-Event-Engine`이 발행하는 `/events`를 Web-Monitoring 쪽으로 넘기되, **네트워크가 끊겼다가 다시 붙어도 그 사이에 놓친 이벤트가 유실되지 않도록** 버퍼링하는 게 이 레포의 핵심 역할이다. 여기에 더해 SLAM 지도, 로봇 위치(pose), 배터리/하드웨어 텔레메트리를 같은 연결로 함께 relay하고, 웹에서 들어오는 드라이브·미션 제어 명령을 ROS2로 중계한다.
 
 rosbridge_suite를 쓰지 않는다. rosbridge는 pub/sub을 WebSocket으로 중계만 할 뿐 끊긴 동안의 메시지를 들고 있다가 재전송하는 기능이 없어서, 이벤트처럼 "놓치면 안 되는" 데이터에는 맞지 않다. 또한 원격 관제에서 로봇을 직접 제어(E-Stop, 미션 시작/종료)하려면 클라이언트 → 서버 방향 명령 채널도 필요한데 이 역시 rosbridge 범용 프로토콜보다는 커스텀 레이어가 다루기 쉽다. 대신 `comm_relay_node`가 자체 WebSocket 프로토콜로 버퍼링·재전송·연결 상태 보고·명령 처리까지 직접 처리한다.
 
@@ -94,13 +94,13 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 
 **알려진 단순화**: `origin`의 회전(yaw)은 프레임에 실어 보내지만, 지금 프론트(`S2M-Web-Monitoring`의 `MapView`)는 회전이 0이라고 가정하고 위치 오프셋만 반영한다. 만약 origin이 회전되어 있으면 `comm_relay_node`가 ROS 로그에 경고를 남긴다.
 
-**로봇 위치 (pose, 신규):**
+**로봇 위치 (pose):**
 ```json
 { "kind": "pose", "x": 1.23, "y": -0.45, "yaw": 0.78 }
 ```
 `map_frame` → `base_frame` TF를 `pose_relay_period_s`(기본 0.1초)마다 조회해서 broadcast한다. TF 조회에 실패하면(아직 SLAM/AMCL이 준비되지 않았거나 프레임이 없는 경우) 조용히 스킵한다. 버퍼링하지 않으므로 연결이 끊긴 동안의 pose는 재전송되지 않는다.
 
-**배터리 상태 (drive_battery, 신규):**
+**배터리 상태 (drive_battery):**
 ```json
 {
   "kind": "drive_battery",
@@ -109,7 +109,7 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 ```
 `/drive/battery`(`sensor_msgs/BatteryState`) 구독값을 바탕으로 만든다. `warning_level`은 `percentage <= 10`이면 `Dead`, `<= 20`이면 `Warning`, 그 외엔 `Normal`이다.
 
-**드라이브 하드웨어 상태 (drive_status, 신규):**
+**드라이브 하드웨어 상태 (drive_status):**
 ```json
 {
   "kind": "drive_status",
@@ -129,15 +129,15 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 
 배터리/드라이브 상태 둘 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins).
 
-**미션 상태 (mission_status, 신규):**
+**미션 상태 (mission_status):**
 ```json
 { "kind": "mission_status", "mission": "EXPLORE" }
 ```
 `launch_mission`/`stop_mission` 명령을 처리한 직후 결과 상태(`IDLE` / `EXPLORE` / `RETURN`)를 broadcast한다.
 
-### 클라이언트 → 서버 (command, 신규)
+### 클라이언트 → 서버 (command)
 
-이전 버전 README는 "클라이언트가 보내는 프레임은 무시함"이라고 적혀 있었지만, 지금은 `kind: "command"` 프레임을 받아서 실제로 처리한다.
+`kind: "command"` 프레임을 받아서 드라이브·미션 제어에 반영한다.
 
 ```json
 { "kind": "command", "command": "estop" }
@@ -188,12 +188,12 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `map_topic` | `/map` | 구독할 지도 토픽 (nav_msgs/OccupancyGrid) |
 | `map_relay_period_s` | `2.0` | 지도를 이 주기보다 자주 다시 보내지 않음 |
 | `map_zlib_level` | `6` | 그리드 압축 레벨 (0-9) |
-| `map_frame` | `map` | 로봇 위치 조회 기준 프레임 (신규) |
-| `base_frame` | `base_link` | 로봇 위치 조회 대상 프레임 (신규) |
-| `pose_relay_period_s` | `0.1` | 로봇 위치 broadcast 주기 (신규) |
-| `battery_topic` | `/drive/battery` | 구독할 배터리 토픽 (`sensor_msgs/BatteryState`, 신규) |
-| `drive_status_topic` | `/drive/status` | 구독할 드라이브 상태 토픽 (`scout2map_msgs/DriveStatus`, 신규) |
-| `telemetry_relay_period_s` | `10.0` | 배터리/드라이브 상태 broadcast 주기, 클라이언트 연결 시에만 (신규) |
+| `map_frame` | `map` | 로봇 위치 조회 기준 프레임 |
+| `base_frame` | `base_link` | 로봇 위치 조회 대상 프레임 |
+| `pose_relay_period_s` | `0.1` | 로봇 위치 broadcast 주기 |
+| `battery_topic` | `/drive/battery` | 구독할 배터리 토픽 (`sensor_msgs/BatteryState`) |
+| `drive_status_topic` | `/drive/status` | 구독할 드라이브 상태 토픽 (`scout2map_msgs/DriveStatus`) |
+| `telemetry_relay_period_s` | `10.0` | 배터리/드라이브 상태 broadcast 주기, 클라이언트 연결 시에만 |
 
 ## 빌드 & 실행
 
@@ -217,9 +217,9 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - 버퍼링 확인: 클라이언트를 끊고 그 사이 이벤트를 몇 개 발생시킨 뒤 재접속 → `status`의 `buffered_count`와 실제로 온 `event` 프레임 개수가 맞는지, `replay: true`로 표시되는지 확인
 - `ros2 topic echo /relay/link_status`로 로컬에서도 연결 상태를 볼 수 있다
 - 지도 확인: SLAM/AMCL을 같이 띄운 상태에서 `ros2 topic hz /map`으로 실제 발행되는지 먼저 확인하고, 웹 화면에서 지도가 뜨는지, 로그에 `web client connected`가 찍힌 직후 최신 지도가 바로 오는지 확인
-- **포즈 확인 (신규)**: `map` → `base_link` TF가 발행 중인 상태에서 웹 화면의 로봇 마커가 실제 위치/헤딩과 맞게 움직이는지 확인
-- **텔레메트리 확인 (신규)**: `/drive/battery`, `/drive/status`를 발행한 뒤 웹 화면의 Hardware Telemetry 패널 값이 `telemetry_relay_period_s` 주기로 갱신되는지 확인
-- **명령 채널 확인 (신규)**: `wscat`으로 `{"kind":"command","command":"estop"}`를 보내고 `/drive/estop` 서비스가 실제로 호출되는지, `ros2 service list`에 해당 서비스가 떠 있어야 정상 응답하는지 확인. 미션 명령은 `launch_mission`/`stop_mission` 전송 후 `ros2 node list`에 `explore_lite`/`s2m_return_home_real` 관련 노드가 뜨고 내려가는지, `mission_status` 프레임이 브로드캐스트되는지 확인
+- **포즈 확인**: `map` → `base_link` TF가 발행 중인 상태에서 웹 화면의 로봇 마커가 실제 위치/헤딩과 맞게 움직이는지 확인
+- **텔레메트리 확인**: `/drive/battery`, `/drive/status`를 발행한 뒤 웹 화면의 Hardware Telemetry 패널 값이 `telemetry_relay_period_s` 주기로 갱신되는지 확인
+- **명령 채널 확인**: `wscat`으로 `{"kind":"command","command":"estop"}`를 보내고 `/drive/estop` 서비스가 실제로 호출되는지, `ros2 service list`에 해당 서비스가 떠 있어야 정상 응답하는지 확인. 미션 명령은 `launch_mission`/`stop_mission` 전송 후 `ros2 node list`에 `explore_lite`/`s2m_return_home_real` 관련 노드가 뜨고 내려가는지, `mission_status` 프레임이 브로드캐스트되는지 확인
 
 ## 알려진 제한사항
 
@@ -229,10 +229,3 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - **지도 origin 회전을 반영하지 않는다.** `origin.yaw`가 0이 아니면 프론트 마커 위치가 틀어진다.
 - **미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite`/`s2m_return_home_real` subprocess의 핸들을 잃어버려서, 실제로는 떠 있는데 `stop_mission`으로 종료할 수 없는 상태가 될 수 있다. 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 것을 권장한다.
 - **서비스 호출 실패가 클라이언트에 전달되지 않는다.** `/drive/estop` 등이 응답 가능 상태가 아니면 서버 로그에만 경고가 남고, 웹 화면에는 별도 에러가 표시되지 않는다.
-
-## 로드맵 (스코프 밖, 참고용)
-
-- raw 센서 스트림 relay
-- 멀티 클라이언트 지원이 필요해지면 클라이언트별 커서(마지막으로 받은 `seq`) 추적으로 확장
-- command 채널에 대한 인증/권한 검증 (현재는 접속만 되면 누구나 명령 가능)
-- 미션 subprocess 상태를 재시작 후에도 복구할 수 있는 방법 (예: PID 파일, 상태 파일)
