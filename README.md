@@ -30,9 +30,11 @@ TF (map → base_link)     ──►            │  (버퍼링 없음, pose_rel
                                   ▲ command 프레임 (estop / clear_fault / reset_odom /
                                   │  launch_mission / stop_mission)
                                   │
-                    /drive/estop, /drive/clear_fault,     explore_lite,
-                    /drive/reset_odom (Trigger 서비스)     s2m_return_home_real
-                                                            (ros2 launch subprocess)
+                    /drive/estop, /drive/clear_fault,     explore_lite            /return_home/trigger,
+                    /drive/reset_odom (Trigger 서비스)     (ros2 launch subprocess) /return_home/arm
+                                                                                    (Trigger/SetBool 서비스,
+                                                                                    return_home_node는 별도
+                                                                                    launch로 이미 떠 있음)
 ```
 
 ## 왜 커스텀 프로토콜인가
@@ -135,6 +137,18 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 ```
 `launch_mission`/`stop_mission` 명령을 처리한 직후 결과 상태(`IDLE` / `EXPLORE` / `RETURN`)를 broadcast한다.
 
+**복귀 목표 지점 (return_home_goal):**
+```json
+{ "kind": "return_home_goal", "x": 1.5, "y": -2.25, "yaw": 1.5708 }
+```
+`return_home_pose_topic`(기본 `/return_home/start_pose`, `geometry_msgs/PoseStamped`)을 구독해서 만든다. `return_home_node`가 출발 지점을 캡처할 때 한 번 발행하고 그 뒤로는 바뀌지 않는다 — 실제로 복귀 시 Nav2에 보내는 목표도 이 캡처된 시작 위치 그대로다(별도의 "현재 목표"가 따로 있는 게 아니다). 토픽이 `TRANSIENT_LOCAL`(latched)이라 `map`처럼 최근값을 캐싱해뒀다가 새로 붙는 클라이언트에게 바로 보내준다.
+
+**복귀 상태 (return_home_status):**
+```json
+{ "kind": "return_home_status", "state": "RETURNING", "start_captured": true }
+```
+`return_home_status_topic`(기본 `/return_home/status`, `std_msgs/String` JSON)을 구독해서 `state`/`start_captured` 두 필드만 추려 relay한다. 원본 JSON에는 `armed`, `heartbeat_age_sec` 등 더 많은 필드가 있지만 지도 마커 렌더링에는 이 둘이면 충분해서 나머지는 걸러낸다. `state`는 `WAITING_FOR_START` / `START_POSE_CAPTURED` / `NORMAL` / `RETURN_REQUESTED` / `RETURNING` / `ARRIVED` / `SAFE_STOP` 중 하나다. 원본 페이로드가 JSON으로 파싱되지 않으면 경고 로그만 남기고 이전 캐시 값을 그대로 유지한다(깨진 프레임 하나 때문에 화면이 빈 값으로 덮이지 않도록). `return_home_goal`과 마찬가지로 latched라 새로 붙는 클라이언트에게 최근값을 바로 보내준다.
+
 ### 클라이언트 → 서버 (command)
 
 `kind: "command"` 프레임을 받아서 드라이브·미션 제어에 반영한다.
@@ -151,8 +165,9 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 | `clear_fault` | `/drive/clear_fault` (`std_srvs/Trigger`) 비동기 호출 |
 | `reset_odom` | `/drive/reset_odom` (`std_srvs/Trigger`) 비동기 호출 |
 | `launch_mission` (`mission: explore`) | `ros2 launch explore_lite explore.launch.py` subprocess 시작, 이미 실행 중이면 무시하고 경고 로그 |
-| `launch_mission` (`mission: return_home`) | `ros2 launch s2m_bringup s2m_return_home_real.launch.py` subprocess 시작 |
-| `stop_mission` (`mission: explore\|return_home`) | 해당 subprocess `terminate()` |
+| `launch_mission` (`mission: return_home`) | `/return_home/trigger`(`std_srvs/Trigger`) 비동기 호출 — subprocess를 새로 띄우는 게 아니라, 이미 `s2m_return_home_real.launch.py`로 떠 있는 `return_home_node`에게 "지금 복귀 시작"을 지시하는 것이다. 응답이 `success: false`면 경고 로그만 남기고 넘어간다 |
+| `stop_mission` (`mission: explore`) | `explore_lite` subprocess `terminate()` + `explore_cmd_vel_topic`(기본 `/cmd_vel`)에 0속도 `Twist` 발행 |
+| `stop_mission` (`mission: return_home`) | `/return_home/arm`(`std_srvs/SetBool`, `data: false`) 비동기 호출로 disarm — `return_home_node`가 안전 정지 처리 |
 
 서비스가 0.5초 안에 응답 가능 상태가 아니면(`wait_for_service` 타임아웃) 경고만 로그로 남기고 넘어간다 — 호출 실패가 클라이언트에게 별도로 통보되지는 않는다.
 
@@ -194,6 +209,9 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `battery_topic` | `/drive/battery` | 구독할 배터리 토픽 (`sensor_msgs/BatteryState`) |
 | `drive_status_topic` | `/drive/status` | 구독할 드라이브 상태 토픽 (`scout2map_msgs/DriveStatus`) |
 | `telemetry_relay_period_s` | `10.0` | 배터리/드라이브 상태 broadcast 주기, 클라이언트 연결 시에만 |
+| `return_home_pose_topic` | `/return_home/start_pose` | 구독할 복귀 시작 위치 토픽 (`geometry_msgs/PoseStamped`, latched) |
+| `return_home_status_topic` | `/return_home/status` | 구독할 복귀 상태 토픽 (`std_msgs/String` JSON, latched) |
+| `explore_cmd_vel_topic` | `/cmd_vel` | `stop_mission`(explore)에서 0속도 `Twist`를 발행할 토픽 |
 
 ## 빌드 & 실행
 
@@ -207,7 +225,7 @@ source install/setup.bash
 ros2 launch scout2map_comm comm_relay.launch.py
 ```
 
-의존 패키지: `rclpy`, `std_msgs`, `nav_msgs`, `sensor_msgs`, `std_srvs`, `tf2_ros`, `scout2map_msgs`(DriveStatus 메시지 정의), `websockets`(python3-websockets). 명령 채널(estop/mission)이 붙으면서 서비스 클라이언트(`std_srvs/Trigger`)와 TF 리스너(`tf2_ros`)가 새로 추가됐다.
+의존 패키지: `rclpy`, `std_msgs`, `nav_msgs`, `geometry_msgs`(PoseStamped/Twist), `sensor_msgs`, `std_srvs`, `tf2_ros`, `scout2map_msgs`(DriveStatus 메시지 정의), `websockets`(python3-websockets). 전부 `package.xml`에 `<depend>`로 선언돼 있어서 `rosdep install`로 해결된다.
 
 ## 테스트 방법
 
@@ -227,5 +245,5 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - **버퍼 전달과 clear 사이에 아주 작은 유실 창이 있다.** 클라이언트 접속 직후 버퍼를 비우고 전송을 시작하는데, 전송 도중 그 클라이언트가 바로 끊기면 아직 못 보낸 나머지는 유실된다.
 - **인증/암호화가 없다. E-Stop과 미션 launch까지 이 채널로 오간다는 점에서 이전보다 더 중요한 제약이 됐다.** 지금은 현장 로컬 Wi-Fi/AP 안에서만 쓰는 걸 전제로 한다. 같은 네트워크의 누구나 명령 프레임만 만들면 로봇을 정지시키거나 미션을 시작/종료시킬 수 있다. 인터넷 경유로 확장하거나 신뢰할 수 없는 네트워크에 노출하게 되면 이 앞단에 반드시 TLS(WSS)와 토큰 인증을 붙여야 한다.
 - **지도 origin 회전을 반영하지 않는다.** `origin.yaw`가 0이 아니면 프론트 마커 위치가 틀어진다.
-- **미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite`/`s2m_return_home_real` subprocess의 핸들을 잃어버려서, 실제로는 떠 있는데 `stop_mission`으로 종료할 수 없는 상태가 될 수 있다. 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 것을 권장한다.
+- **explore 미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite` subprocess의 핸들을 잃어버려서, 실제로는 떠 있는데 `stop_mission`으로 종료할 수 없는 상태가 될 수 있다. 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 것을 권장한다. (`return_home`은 subprocess가 아니라 서비스 호출이라 이 문제가 없다 — `return_home_node`는 `s2m_return_home_real.launch.py`로 이미 떠 있는 상태를 전제로 트리거/암 서비스만 부른다.)
 - **서비스 호출 실패가 클라이언트에 전달되지 않는다.** `/drive/estop` 등이 응답 가능 상태가 아니면 서버 로그에만 경고가 남고, 웹 화면에는 별도 에러가 표시되지 않는다.
