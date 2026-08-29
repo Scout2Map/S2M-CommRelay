@@ -13,7 +13,7 @@ import zlib
 from collections import deque
 
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -64,6 +64,20 @@ class CommRelayNode(Node):
         self.declare_parameter('drive_status_topic', '/drive/status')
         self.declare_parameter('telemetry_relay_period_s', 10.0)
 
+        # Return-home goal, so the operator can see where the robot is
+        # headed instead of just the state text. Both topics are published
+        # by return_home_node with TRANSIENT_LOCAL/RELIABLE QoS (latched) -
+        # match it below so a relay started after the last publish still
+        # gets the current value instead of waiting for the next change.
+        self.declare_parameter('return_home_pose_topic', '/return_home/start_pose')
+        self.declare_parameter('return_home_status_topic', '/return_home/status')
+
+        # explore_lite's own cmd_vel output, so _stop_explore_mission can
+        # publish a zero-velocity message on top of killing the subprocess -
+        # terminate() alone can leave residual momentum if the process was
+        # mid-command when it died.
+        self.declare_parameter('explore_cmd_vel_topic', '/cmd_vel')
+
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
         self._ws_port = int(self.get_parameter('ws_port').value)
@@ -84,10 +98,24 @@ class CommRelayNode(Node):
         self._battery_topic = self.get_parameter('battery_topic').value
         self._drive_status_topic = self.get_parameter('drive_status_topic').value
         self._telemetry_relay_period_s = float(self.get_parameter('telemetry_relay_period_s').value)
-        
+
+        self._return_home_pose_topic = self.get_parameter('return_home_pose_topic').value
+        self._return_home_status_topic = self.get_parameter('return_home_status_topic').value
+
+        self._explore_cmd_vel_topic = self.get_parameter('explore_cmd_vel_topic').value
+
         self._telemetry_lock = threading.Lock()
         self._latest_battery_payload = None
         self._latest_drive_status_payload = None
+
+        # Cached so a client that connects after the last publish (both
+        # topics are latched, but that only guarantees comm_relay's own
+        # subscription gets the backlog - not any browser that joins later)
+        # still gets the current goal/state right away, same idea as the
+        # map catch-up below.
+        self._return_home_lock = threading.Lock()
+        self._latest_return_home_goal = None
+        self._latest_return_home_status = None
 
         # Subprocess handler for exploration mission
         self._explore_process = None
@@ -142,6 +170,9 @@ class CommRelayNode(Node):
         self._cli_return_trigger = self.create_client(Trigger, '/return_home/trigger')
         self._cli_return_arm = self.create_client(SetBool, '/return_home/arm')
 
+        # zero-velocity publisher used by _stop_explore_mission
+        self._stop_pub = self.create_publisher(Twist, self._explore_cmd_vel_topic, 10)
+
         # Map publishers (slam_toolbox, nav2 map_server) typically latch the
         # last map with TRANSIENT_LOCAL durability - match it, otherwise a
         # relay started after the last publish would wait for the next one.
@@ -152,6 +183,15 @@ class CommRelayNode(Node):
         )
         self._map_sub = self.create_subscription(
             OccupancyGrid, self._map_topic, self._on_map, map_qos)
+
+        # return_home_node publishes both with the same latched QoS as /map.
+        self._return_home_pose_sub = self.create_subscription(
+            PoseStamped, self._return_home_pose_topic,
+            self._on_return_home_pose, map_qos)
+        self._return_home_status_sub = self.create_subscription(
+            String, self._return_home_status_topic,
+            self._on_return_home_status, map_qos)
+
         self._status_timer = self.create_timer(
             self._link_status_period_s, self._publish_status)
         self._map_timer = self.create_timer(
@@ -234,6 +274,17 @@ class CommRelayNode(Node):
                 latest_bytes = self._latest_map_bytes
             if latest_meta is not None:
                 await self._send_frames(websocket, [json.dumps(latest_meta), latest_bytes])
+
+            # Same idea for the return-home goal/state - both topics are
+            # latched at the ROS level so comm_relay already has the
+            # current value even if it arrived before this client connected.
+            with self._return_home_lock:
+                latest_goal = self._latest_return_home_goal
+                latest_status = self._latest_return_home_status
+            if latest_goal is not None:
+                await self._send_frames(websocket, [latest_goal])
+            if latest_status is not None:
+                await self._send_frames(websocket, [latest_status])
 
             # Process Inbound Websocket Messages (Commands from Web Monitoring)
             async for raw_inbound in websocket:
@@ -554,6 +605,41 @@ class CommRelayNode(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
+
+    def _on_return_home_pose(self, msg: PoseStamped):
+        payload = json.dumps({
+            'kind': 'return_home_goal',
+            'x': msg.pose.position.x,
+            'y': msg.pose.position.y,
+            'yaw': self._yaw_from_quaternion(msg.pose.orientation),
+        })
+        with self._return_home_lock:
+            self._latest_return_home_goal = payload
+
+        with self._buffer_lock:
+            has_clients = bool(self._ws_clients)
+        if has_clients:
+            asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+
+    def _on_return_home_status(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            self.get_logger().warning('malformed /return_home/status frame, dropping it')
+            return
+
+        payload = json.dumps({
+            'kind': 'return_home_status',
+            'state': data.get('state'),
+            'start_captured': data.get('start_captured'),
+        })
+        with self._return_home_lock:
+            self._latest_return_home_status = payload
+
+        with self._buffer_lock:
+            has_clients = bool(self._ws_clients)
+        if has_clients:
+            asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
 
     def _on_map(self, msg: OccupancyGrid):
         info = msg.info

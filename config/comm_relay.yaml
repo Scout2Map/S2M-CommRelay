@@ -42,3 +42,13 @@ comm_relay:
     # without burning much CPU on the Pi). Raise toward 9 if bandwidth still
     # hurts and the Pi has CPU to spare, lower toward 1 if it's the reverse.
     map_zlib_level: 6
+
+    # return_home_node's captured start pose + state machine (s2m_bringup).
+    # Both are latched (TRANSIENT_LOCAL) so a relay started after the last
+    # publish still picks up the current value.
+    return_home_pose_topic: /return_home/start_pose
+    return_home_status_topic: /return_home/status
+
+    # explore_lite's own cmd_vel output. _stop_explore_mission publishes a
+    # zero-velocity Twist here on stop, on top of killing the subprocess.
+    explore_cmd_vel_topic: /cmd_vel
