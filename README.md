@@ -26,6 +26,8 @@ TF (map → base_link)     ──►            │  (버퍼링 없음, pose_rel
                                        ▼
                                 ws://<sbc-ip>:9091  ◄──────────►  new WebSocket(...)
                                 /relay/link_status (String, JSON, 로컬 ROS 헤르트비트)
+                                /control/heartbeat (Empty, 웹 클라이언트 연결 시에만
+                                 heartbeat_period_s 주기로 발행 → event_engine, return_home)
 
                                   ▲ command 프레임 (estop / clear_fault / reset_odom /
                                   │  launch_mission / stop_mission)
@@ -225,6 +227,28 @@ ws.onmessage = (ev) => {
 ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 ```
 
+## 관제망 heartbeat (`/control/heartbeat`)
+
+`S2M-Event-Engine`(`COMM_DEGRADED`/`COMM_LOST`)과 `return_home_node`(자동 복귀/안전
+정지 판단)가 둘 다 `bridge-interface-contract.md`에 문서화된 대로 이 토픽을
+구독하지만, 실제 하드웨어에서 발행하는 노드가 없어서 `return_home_node`가 armed
+상태에 영영 못 들어가고 `use_return_home:=true`일 때 `cmd_vel`이 항상 막히는
+문제가 있었다(2026-08-29). `comm_relay`가 문서상 "관제 서버"에 해당하는
+브리지이므로, **웹 클라이언트가 실제로 연결돼 있는 동안에만** `heartbeat_period_s`
+(기본 0.5초) 주기로 이 토픽을 발행한다.
+
+일부러 `heartbeat_period_s`를 두 소비자의 타임아웃(`COMM_DEGRADED` 1.5초,
+`return_home`의 `heartbeat_timeout_sec` 기본 3.0초)보다 훨씬 짧게 잡았다 —
+발행 주기와 타임아웃이 딱 같으면 스케줄링 지터만으로도 오탐이 뜨는 걸
+`return_home_node`의 `motion_inhibit` 레이스에서 이미 한 번 겪었다(`fcd1725`).
+
+클라이언트 연결이 끊기면(관제망 단절) 이 토픽 발행도 즉시 멈춘다 — 이게 의도된
+동작이다: 웹 클라이언트가 안 붙어 있으면 "관제망이 없다"는 게 맞고, 그래야
+`event_engine`의 `COMM_LOST`와 `return_home`의 자동 복귀가 실제로 트리거된다.
+벤치에서 관제 서버 없이 단독으로 테스트할 때는 `event_engine`의
+`require_heartbeat_seen: true` 설정이 `COMM_LOST` 오탐을 막아준다(heartbeat를
+한 번도 못 본 상태에서는 안 띄움).
+
 ## 파라미터 (`config/comm_relay.yaml`)
 
 | 파라미터 | 기본값 | 설명 |
@@ -235,6 +259,8 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `buffer_max_age_s` | `1800.0` | 이보다 오래된 버퍼 항목은 버림 |
 | `link_status_topic` | `/relay/link_status` | 로컬 ROS 연결 상태 헤르트비트 |
 | `link_status_period_s` | `2.0` | 헤르트비트 발행 주기 |
+| `heartbeat_topic` | `/control/heartbeat` | 웹 클라이언트가 실제로 붙어 있는 동안만 발행하는 관제망 heartbeat (`std_msgs/Empty`) |
+| `heartbeat_period_s` | `0.5` | `heartbeat_topic` 발행 주기 |
 | `ws_ping_interval_s` / `ws_ping_timeout_s` | `10.0` / `10.0` | WebSocket keepalive (반쯤 끊긴 연결 빨리 감지) |
 | `map_topic` | `/map` | 구독할 지도 토픽 (nav_msgs/OccupancyGrid) |
 | `map_relay_period_s` | `2.0` | 지도를 이 주기보다 자주 다시 보내지 않음 |

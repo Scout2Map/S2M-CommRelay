@@ -20,7 +20,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import BatteryState
 from scout2map_msgs.msg import DriveStatus, SensorStatus
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 from std_srvs.srv import SetBool, Trigger
 
 import tf2_ros
@@ -49,6 +49,17 @@ class CommRelayNode(Node):
         self.declare_parameter('buffer_max_age_s', 1800.0)
         self.declare_parameter('link_status_topic', '/relay/link_status')
         self.declare_parameter('link_status_period_s', 2.0)
+
+        # /control/heartbeat is documented across the fleet (event_engine,
+        # return_home) as coming from "the control server", but nothing on
+        # real hardware ever actually published it - return_home could
+        # never leave its pre-armed state and cmd_vel_safety_gate blocked
+        # all motion whenever use_return_home:=true (2026-08-29). comm_relay
+        # IS that control server's bridge to the robot, so it is the
+        # correct publisher: heartbeat means "an operator's web client is
+        # actually connected", not just "the process is alive".
+        self.declare_parameter('heartbeat_topic', '/control/heartbeat')
+        self.declare_parameter('heartbeat_period_s', 0.5)
         self.declare_parameter('ws_ping_interval_s', 10.0)
         self.declare_parameter('ws_ping_timeout_s', 10.0)
         self.declare_parameter('map_topic', '/map')
@@ -101,6 +112,8 @@ class CommRelayNode(Node):
         self._buffer_max_age_s = float(self.get_parameter('buffer_max_age_s').value)
         self._link_status_topic = self.get_parameter('link_status_topic').value
         self._link_status_period_s = float(self.get_parameter('link_status_period_s').value)
+        self._heartbeat_topic = self.get_parameter('heartbeat_topic').value
+        self._heartbeat_period_s = float(self.get_parameter('heartbeat_period_s').value)
         self._ping_interval_s = float(self.get_parameter('ws_ping_interval_s').value)
         self._ping_timeout_s = float(self.get_parameter('ws_ping_timeout_s').value)
         self._map_topic = self.get_parameter('map_topic').value
@@ -174,6 +187,7 @@ class CommRelayNode(Node):
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         self._status_pub = self.create_publisher(String, self._link_status_topic, 10)
+        self._heartbeat_pub = self.create_publisher(Empty, self._heartbeat_topic, 10)
         self._sub = self.create_subscription(
             String, self._events_topic, self._on_event, 50)
 
@@ -220,6 +234,14 @@ class CommRelayNode(Node):
 
         self._status_timer = self.create_timer(
             self._link_status_period_s, self._publish_status)
+        # Well under both consumers' timeouts (event_engine COMM_DEGRADED
+        # 1.5s, return_home heartbeat_timeout_sec 3.0s default) with real
+        # margin, not equal to either - an exact-equal period/timeout pair
+        # is what caused the cmd_vel_safety_gate timing race fixed earlier
+        # today (fcd1725), so this is deliberately several times faster
+        # than the tightest threshold rather than matched to it.
+        self._heartbeat_timer = self.create_timer(
+            self._heartbeat_period_s, self._publish_heartbeat)
         self._map_timer = self.create_timer(
             self._map_relay_period_s, self._maybe_broadcast_map)
         self._pose_timer = self.create_timer(
@@ -802,6 +824,15 @@ class CommRelayNode(Node):
         while len(self._buffer) > self._buffer_max_len:
             self._buffer.popleft()
             self._dropped_count += 1
+
+    def _publish_heartbeat(self):
+        # self._link_state is written on the asyncio thread (_on_client)
+        # under self._buffer_lock, so read it under the same lock here on
+        # the rclpy timer thread rather than racing it.
+        with self._buffer_lock:
+            link_ok = self._link_state == 'ok'
+        if link_ok:
+            self._heartbeat_pub.publish(Empty())
 
     def _publish_status(self):
         with self._buffer_lock:
