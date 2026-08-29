@@ -204,10 +204,12 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 | `reset_odom` | `/drive/reset_odom` (`std_srvs/Trigger`) 비동기 호출 |
 | `launch_mission` (`mission: explore`) | `ros2 launch explore_lite explore.launch.py` subprocess 시작, 이미 실행 중이면 무시하고 경고 로그 |
 | `launch_mission` (`mission: return_home`) | `/return_home/trigger`(`std_srvs/Trigger`) 비동기 호출 — subprocess를 새로 띄우는 게 아니라, 이미 `s2m_slam_real.launch.py use_return_home:=true`로 떠 있는 `return_home_node`에게 "지금 복귀 시작"을 지시하는 것이다. 응답이 `success: false`면 경고 로그만 남기고 넘어간다 |
-| `stop_mission` (`mission: explore`) | `explore_lite` subprocess `terminate()` + `explore_cmd_vel_topic`(기본 `/cmd_vel`)에 0속도 `Twist` 발행 |
+| `stop_mission` (`mission: explore`) | `explore_lite` subprocess `terminate()` + `explore_cmd_vel_topic`(기본 `/cmd_vel`)에 0속도 `Twist` 발행 + `navigate_action`(기본 `/navigate_to_pose`)의 `_action/cancel_goal` 서비스로 진행 중인 내비게이션 goal 취소 |
 | `stop_mission` (`mission: return_home`) | `/return_home/arm`(`std_srvs/SetBool`, `data: false`) 비동기 호출로 disarm — `return_home_node`가 안전 정지 처리 |
 
 서비스가 0.5초 안에 응답 가능 상태가 아니면(`wait_for_service` 타임아웃) 경고만 로그로 남기고 넘어간다 — 호출 실패가 클라이언트에게 별도로 통보되지는 않는다.
+
+`stop_mission`(explore)이 goal 취소까지 하는 이유: `explore_lite` subprocess를 죽여도 그게 이미 `bt_navigator`에 보낸 `NavigateToPose` goal은 취소되지 않는다 — action goal의 생명주기는 서버(`bt_navigator`) 쪽이 갖고 있어서, 보낸 클라이언트가 사라져도 goal은 계속 실행/재계획된다. `controller_server`가 `stop_mission`을 받은 뒤에도 계속 `Passing new path to controller`를 찍으면서 로봇이 안 멈추는 게 바로 이 증상이다(2026-08-29). `comm_relay`가 직접 보낸 goal이 없어서(explore_lite/return_home이 각자 보냄) 일반적인 `rclpy.action.ActionClient`로는 취소할 수 없고, 대신 모든 action 서버가 갖고 있는 `<action>/_action/cancel_goal`(`action_msgs/srv/CancelGoal`) 서비스를 직접 호출한다 — `goal_id`/`timestamp`를 비운 요청은 서버에 떠 있는 goal을 전부 취소한다는 게 액션 프로토콜 표준 규약이다.
 
 ## 프론트엔드 최소 예시
 
@@ -277,6 +279,7 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `return_home_pose_topic` | `/return_home/start_pose` | 구독할 복귀 시작 위치 토픽 (`geometry_msgs/PoseStamped`, latched) |
 | `return_home_status_topic` | `/return_home/status` | 구독할 복귀 상태 토픽 (`std_msgs/String` JSON, latched) |
 | `explore_cmd_vel_topic` | `/cmd_vel` | `stop_mission`(explore)에서 0속도 `Twist`를 발행할 토픽 |
+| `navigate_action` | `/navigate_to_pose` | `stop_mission`(explore)에서 진행 중인 goal을 취소할 때 쓰는 NavigateToPose action 이름 |
 
 ## 빌드 & 실행
 

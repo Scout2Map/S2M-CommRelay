@@ -13,6 +13,7 @@ import zlib
 from collections import deque
 
 import rclpy
+from action_msgs.srv import CancelGoal
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
@@ -105,6 +106,18 @@ class CommRelayNode(Node):
         # mid-command when it died.
         self.declare_parameter('explore_cmd_vel_topic', '/cmd_vel')
 
+        # The NavigateToPose action explore_lite's own action client sends
+        # goals to (bt_navigator) - shared with return_home_node's own
+        # 'navigate_action' param and not affected by the /cmd_vel remap
+        # use_return_home applies, so one client here covers both missions.
+        # stop_mission(explore) needs this: killing the explore_lite
+        # process does NOT cancel whatever goal it already sent - action
+        # goal lifecycle is server-side, so bt_navigator just keeps
+        # executing/replanning it forever, which is why "stop" looked like
+        # it did nothing while controller_server kept logging "Passing new
+        # path to controller" (2026-08-29).
+        self.declare_parameter('navigate_action', '/navigate_to_pose')
+
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
         self._ws_port = int(self.get_parameter('ws_port').value)
@@ -136,6 +149,7 @@ class CommRelayNode(Node):
         self._return_home_status_topic = self.get_parameter('return_home_status_topic').value
 
         self._explore_cmd_vel_topic = self.get_parameter('explore_cmd_vel_topic').value
+        self._navigate_action = self.get_parameter('navigate_action').value
 
         self._telemetry_lock = threading.Lock()
         self._latest_battery_payload = None
@@ -212,6 +226,20 @@ class CommRelayNode(Node):
 
         # zero-velocity publisher used by _stop_explore_mission
         self._stop_pub = self.create_publisher(Twist, self._explore_cmd_vel_topic, 10)
+
+        # Cancels explore_lite's active NavigateToPose goal on stop_mission.
+        # A plain CancelGoal service client (the standard
+        # <action>/_action/cancel_goal service every action server exposes)
+        # rather than a full rclpy ActionClient, since comm_relay never sent
+        # the goal itself and so has no local goal handle to reference - an
+        # ActionClient can normally only cancel goals it sent. A request
+        # with a zero-filled goal_id and zero timestamp cancels every goal
+        # currently active on the server (action_msgs/srv/CancelGoal
+        # semantics), which is what terminate()-ing explore_lite's process
+        # does NOT do by itself, see the navigate_action parameter comment
+        # above.
+        self._navigate_cancel_client = self.create_client(
+            CancelGoal, f'{self._navigate_action}/_action/cancel_goal')
 
         # Map publishers (slam_toolbox, nav2 map_server) typically latch the
         # last map with TRANSIENT_LOCAL durability - match it, otherwise a
@@ -416,7 +444,35 @@ class CommRelayNode(Node):
         stop_cmd = Twist()
         self._stop_pub.publish(stop_cmd)
 
+        # Killing the explore_lite process above does not cancel the
+        # NavigateToPose goal it already sent - bt_navigator keeps
+        # executing/replanning that goal indefinitely regardless, which is
+        # why the robot kept moving (controller_server logging "Passing new
+        # path to controller" on repeat) after stop_mission looked like it
+        # did nothing (2026-08-29). Cancel it explicitly.
+        self._cancel_active_navigation()
+
         self._broadcast_mission_status('IDLE')
+
+    def _cancel_active_navigation(self):
+        if not self._navigate_cancel_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(
+                f'{self._navigate_action} cancel service is not available - '
+                'any in-flight navigation goal was NOT cancelled')
+            return
+
+        req = CancelGoal.Request()  # zero goal_id + zero timestamp = cancel all
+        future = self._navigate_cancel_client.call_async(req)
+
+        def _on_cancel_done(f):
+            try:
+                res = f.result()
+                n = len(res.goals_canceling)
+                self.get_logger().info(f'cancelled {n} active navigation goal(s)')
+            except Exception as exc:
+                self.get_logger().error(f'navigation cancel call failed: {exc}')
+
+        future.add_done_callback(_on_cancel_done)
 
     def _start_return_mission(self):
         # call trigger service on the active return_home node
