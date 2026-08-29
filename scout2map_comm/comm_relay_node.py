@@ -13,6 +13,7 @@ import zlib
 from collections import deque
 
 import rclpy
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
@@ -70,6 +71,15 @@ class CommRelayNode(Node):
         # without SSHing in and running ros2 topic echo.
         self.declare_parameter('sensor_status_topic', '/sensors/status')
 
+        # scout_vision publishes its own inference health on the shared
+        # /diagnostics bus (diagnostic_msgs/DiagnosticArray, alongside other
+        # nodes like ekf_filter_node) - only the 'scout_vision/inference'
+        # entry is relayed. This is what would have shown a camera that
+        # never delivered a frame (2026-08-29) without ros2 topic echo.
+        self.declare_parameter('diagnostics_topic', '/diagnostics')
+        self.declare_parameter(
+            'vision_diagnostic_name', 'scout_vision/inference')
+
         # Return-home goal, so the operator can see where the robot is
         # headed instead of just the state text. Both topics are published
         # by return_home_node with TRANSIENT_LOCAL/RELIABLE QoS (latched) -
@@ -105,6 +115,9 @@ class CommRelayNode(Node):
         self._drive_status_topic = self.get_parameter('drive_status_topic').value
         self._telemetry_relay_period_s = float(self.get_parameter('telemetry_relay_period_s').value)
         self._sensor_status_topic = self.get_parameter('sensor_status_topic').value
+        self._diagnostics_topic = self.get_parameter('diagnostics_topic').value
+        self._vision_diagnostic_name = self.get_parameter(
+            'vision_diagnostic_name').value
 
         self._return_home_pose_topic = self.get_parameter('return_home_pose_topic').value
         self._return_home_status_topic = self.get_parameter('return_home_status_topic').value
@@ -115,6 +128,7 @@ class CommRelayNode(Node):
         self._latest_battery_payload = None
         self._latest_drive_status_payload = None
         self._latest_sensor_status_payload = None
+        self._latest_vision_status_payload = None
 
         # Cached so a client that connects after the last publish (both
         # topics are latched, but that only guarantees comm_relay's own
@@ -170,6 +184,8 @@ class CommRelayNode(Node):
             DriveStatus, self._drive_status_topic, self._on_drive_status, 10)
         self._sensor_status_sub = self.create_subscription(
             SensorStatus, self._sensor_status_topic, self._on_sensor_status, 10)
+        self._diagnostics_sub = self.create_subscription(
+            DiagnosticArray, self._diagnostics_topic, self._on_diagnostics, 10)
 
         # ROS 2 Service Clients for Drive Controls
         self._cli_estop = self.create_client(Trigger, '/drive/estop')
@@ -551,6 +567,52 @@ class CommRelayNode(Node):
         except Exception as exc:
             self.get_logger().error(f'Error parsing /sensors/status msg: {exc}')
 
+    _DIAG_LEVEL_NAMES = {
+        DiagnosticStatus.OK: 'OK',
+        DiagnosticStatus.WARN: 'WARN',
+        DiagnosticStatus.ERROR: 'ERROR',
+        DiagnosticStatus.STALE: 'STALE',
+    }
+
+    def _on_diagnostics(self, msg: DiagnosticArray):
+        """diagnostic_msgs/DiagnosticArray 콜백 -> scout_vision 항목만 추출
+
+        /diagnostics는 ekf_filter_node 등 여러 노드가 같이 쓰는 공용 버스라,
+        vision_diagnostic_name('scout_vision/inference' 기본값)과 일치하는
+        항목만 골라서 캐시한다. 카메라가 프레임을 한 번도 못 받은 상태
+        (frame_age_s 없음, 2026-08-29 사례)를 SSH 없이 보여주기 위함.
+        """
+        try:
+            target = None
+            for status in msg.status:
+                if status.name == self._vision_diagnostic_name:
+                    target = status
+                    break
+            if target is None:
+                return
+
+            values = {kv.key: kv.value for kv in target.values}
+            level_byte = (
+                target.level[0]
+                if isinstance(target.level, (bytes, bytearray))
+                else target.level
+            )
+            payload = json.dumps({
+                'kind': 'vision_camera_status',
+                'data': {
+                    'level': self._DIAG_LEVEL_NAMES.get(level_byte, 'UNKNOWN'),
+                    'message': target.message,
+                    'frame_age_s': values.get('frame_age_s'),
+                    'last_latency_ms': values.get('last_latency_ms'),
+                    'p95_latency_ms': values.get('p95_latency_ms'),
+                    'model_sha256': values.get('model_sha256'),
+                }
+            })
+            with self._telemetry_lock:
+                self._latest_vision_status_payload = payload
+        except Exception as exc:
+            self.get_logger().error(f'Error parsing /diagnostics msg: {exc}')
+
     def _broadcast_robot_pose(self):
         with self._buffer_lock:
             if not self._ws_clients:
@@ -592,9 +654,11 @@ class CommRelayNode(Node):
             batt_payload = self._latest_battery_payload
             status_payload = self._latest_drive_status_payload
             sensor_payload = self._latest_sensor_status_payload
+            vision_payload = self._latest_vision_status_payload
             self._latest_battery_payload = None
             self._latest_drive_status_payload = None
             self._latest_sensor_status_payload = None
+            self._latest_vision_status_payload = None
 
         if batt_payload:
             asyncio.run_coroutine_threadsafe(self._broadcast(batt_payload), self._loop)
@@ -602,6 +666,8 @@ class CommRelayNode(Node):
             asyncio.run_coroutine_threadsafe(self._broadcast(status_payload), self._loop)
         if sensor_payload:
             asyncio.run_coroutine_threadsafe(self._broadcast(sensor_payload), self._loop)
+        if vision_payload:
+            asyncio.run_coroutine_threadsafe(self._broadcast(vision_payload), self._loop)
 
     def _next_seq(self):
         with self._buffer_lock:

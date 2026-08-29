@@ -17,6 +17,7 @@
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
   <depend>scout2map_msgs</depend>
+  <depend>diagnostic_msgs</depend>
   <!-- If rosdep can't resolve this key on your distro, pip install it
        instead: pip install websockets (add the break system packages flag
        on Debian/Ubuntu managed-Python installs) -->

@@ -149,7 +149,23 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 ```
 `/sensors/status`(`scout2map_msgs/SensorStatus`, Pico 센서-퓨전 MCU를 잇는 `sensor_bridge`가 발행)를 그대로 옮긴다. `*_present`/`pms7003_seen`은 MCU 부팅 배너로 초기화된 뒤 실제 데이터로 확정되는 값이라, 한 번도 값을 못 보낸 센서(2026-08-29 BH1750 미인식 사례처럼 배선/I2C 주소 문제로 부팅 시 초기화 자체가 실패한 경우)를 운영자가 `ros2 topic echo` 없이 바로 알아챌 수 있게 해준다. `EnvSnapshot`의 `*_valid` 플래그는 "값이 있는데 오래됐다"만 구분하고 "애초에 값이 온 적 없다"는 구분하지 못하므로, 이 상태는 `EnvSnapshot`이 아니라 `SensorStatus`에서만 확인 가능하다.
 
-배터리/드라이브/센서 MCU 상태 셋 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins).
+**비전 카메라 상태 (vision_camera_status):**
+```json
+{
+  "kind": "vision_camera_status",
+  "data": {
+    "level": "WARN",
+    "message": "waiting for camera frames",
+    "frame_age_s": null,
+    "last_latency_ms": null,
+    "p95_latency_ms": null,
+    "model_sha256": "adeea580ab..."
+  }
+}
+```
+`diagnostics_topic`(기본 `/diagnostics`, `diagnostic_msgs/DiagnosticArray`)를 구독하되, `vision_diagnostic_name`(기본 `scout_vision/inference`)과 이름이 일치하는 항목 하나만 골라서 옮긴다 — `/diagnostics`는 `ekf_filter_node` 등 다른 노드도 같이 쓰는 공용 버스라서다. `level`은 `OK`/`WARN`/`ERROR`/`STALE`/`UNKNOWN` 중 하나. `vision_node`가 카메라 프레임을 한 번도 못 받았을 때(`frame_age_s`가 원본 메시지에서 문자열 `"unknown"`인 경우) 세 숫자 필드는 전부 `null`로 relay된다 — 값이 느린 게 아니라 아예 안 들어온 것과, 느리게 들어오는 것(STALE)을 구분하기 위함이다(2026-08-29 카메라 프레임 미수신 사례).
+
+배터리/드라이브/센서 MCU/비전 카메라 상태 넷 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins).
 
 **미션 상태 (mission_status):**
 ```json
@@ -229,7 +245,9 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `battery_topic` | `/drive/battery` | 구독할 배터리 토픽 (`sensor_msgs/BatteryState`) |
 | `drive_status_topic` | `/drive/status` | 구독할 드라이브 상태 토픽 (`scout2map_msgs/DriveStatus`) |
 | `sensor_status_topic` | `/sensors/status` | 구독할 센서 MCU 상태 토픽 (`scout2map_msgs/SensorStatus`) |
-| `telemetry_relay_period_s` | `10.0` | 배터리/드라이브/센서 MCU 상태 broadcast 주기, 클라이언트 연결 시에만 |
+| `diagnostics_topic` | `/diagnostics` | 구독할 공용 진단 토픽 (`diagnostic_msgs/DiagnosticArray`) |
+| `vision_diagnostic_name` | `scout_vision/inference` | `diagnostics_topic`에서 골라낼 항목의 `name` |
+| `telemetry_relay_period_s` | `10.0` | 배터리/드라이브/센서 MCU/비전 카메라 상태 broadcast 주기, 클라이언트 연결 시에만 |
 | `return_home_pose_topic` | `/return_home/start_pose` | 구독할 복귀 시작 위치 토픽 (`geometry_msgs/PoseStamped`, latched) |
 | `return_home_status_topic` | `/return_home/status` | 구독할 복귀 상태 토픽 (`std_msgs/String` JSON, latched) |
 | `explore_cmd_vel_topic` | `/cmd_vel` | `stop_mission`(explore)에서 0속도 `Twist`를 발행할 토픽 |
@@ -246,7 +264,7 @@ source install/setup.bash
 ros2 launch scout2map_comm comm_relay.launch.py
 ```
 
-의존 패키지: `rclpy`, `std_msgs`, `nav_msgs`, `geometry_msgs`(PoseStamped/Twist), `sensor_msgs`, `std_srvs`, `tf2_ros`, `scout2map_msgs`(DriveStatus/SensorStatus 메시지 정의), `websockets`(python3-websockets). 전부 `package.xml`에 `<depend>`로 선언돼 있어서 `rosdep install`로 해결된다.
+의존 패키지: `rclpy`, `std_msgs`, `nav_msgs`, `geometry_msgs`(PoseStamped/Twist), `sensor_msgs`, `std_srvs`, `tf2_ros`, `scout2map_msgs`(DriveStatus/SensorStatus 메시지 정의), `diagnostic_msgs`, `websockets`(python3-websockets). 전부 `package.xml`에 `<depend>`로 선언돼 있어서 `rosdep install`로 해결된다.
 
 ## 테스트 방법
 
