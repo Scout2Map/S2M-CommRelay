@@ -165,7 +165,7 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 | `clear_fault` | `/drive/clear_fault` (`std_srvs/Trigger`) 비동기 호출 |
 | `reset_odom` | `/drive/reset_odom` (`std_srvs/Trigger`) 비동기 호출 |
 | `launch_mission` (`mission: explore`) | `ros2 launch explore_lite explore.launch.py` subprocess 시작, 이미 실행 중이면 무시하고 경고 로그 |
-| `launch_mission` (`mission: return_home`) | `/return_home/trigger`(`std_srvs/Trigger`) 비동기 호출 — subprocess를 새로 띄우는 게 아니라, 이미 `s2m_return_home_real.launch.py`로 떠 있는 `return_home_node`에게 "지금 복귀 시작"을 지시하는 것이다. 응답이 `success: false`면 경고 로그만 남기고 넘어간다 |
+| `launch_mission` (`mission: return_home`) | `/return_home/trigger`(`std_srvs/Trigger`) 비동기 호출 — subprocess를 새로 띄우는 게 아니라, 이미 `s2m_slam_real.launch.py use_return_home:=true`로 떠 있는 `return_home_node`에게 "지금 복귀 시작"을 지시하는 것이다. 응답이 `success: false`면 경고 로그만 남기고 넘어간다 |
 | `stop_mission` (`mission: explore`) | `explore_lite` subprocess `terminate()` + `explore_cmd_vel_topic`(기본 `/cmd_vel`)에 0속도 `Twist` 발행 |
 | `stop_mission` (`mission: return_home`) | `/return_home/arm`(`std_srvs/SetBool`, `data: false`) 비동기 호출로 disarm — `return_home_node`가 안전 정지 처리 |
 
@@ -237,7 +237,7 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - 지도 확인: SLAM/AMCL을 같이 띄운 상태에서 `ros2 topic hz /map`으로 실제 발행되는지 먼저 확인하고, 웹 화면에서 지도가 뜨는지, 로그에 `web client connected`가 찍힌 직후 최신 지도가 바로 오는지 확인
 - **포즈 확인**: `map` → `base_link` TF가 발행 중인 상태에서 웹 화면의 로봇 마커가 실제 위치/헤딩과 맞게 움직이는지 확인
 - **텔레메트리 확인**: `/drive/battery`, `/drive/status`를 발행한 뒤 웹 화면의 Hardware Telemetry 패널 값이 `telemetry_relay_period_s` 주기로 갱신되는지 확인
-- **명령 채널 확인**: `wscat`으로 `{"kind":"command","command":"estop"}`를 보내고 `/drive/estop` 서비스가 실제로 호출되는지, `ros2 service list`에 해당 서비스가 떠 있어야 정상 응답하는지 확인. 미션 명령은 `launch_mission`/`stop_mission` 전송 후 `ros2 node list`에 `explore_lite`/`s2m_return_home_real` 관련 노드가 뜨고 내려가는지, `mission_status` 프레임이 브로드캐스트되는지 확인
+- **명령 채널 확인**: `wscat`으로 `{"kind":"command","command":"estop"}`를 보내고 `/drive/estop` 서비스가 실제로 호출되는지, `ros2 service list`에 해당 서비스가 떠 있어야 정상 응답하는지 확인. explore 미션은 `launch_mission`/`stop_mission` 전송 후 `ros2 node list`에 `explore_node`가 뜨고 내려가는지 확인하고, return_home 미션은 노드가 뜨고 내려가는 게 아니라 이미 떠 있는 `return_home` 노드에 `/return_home/trigger`·`/return_home/arm` 서비스가 호출되는지(`ros2 service call`로도 직접 확인 가능) 확인. 둘 다 `mission_status` 프레임이 브로드캐스트되는지 같이 확인
 
 ## 알려진 제한사항
 
@@ -245,5 +245,5 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - **버퍼 전달과 clear 사이에 아주 작은 유실 창이 있다.** 클라이언트 접속 직후 버퍼를 비우고 전송을 시작하는데, 전송 도중 그 클라이언트가 바로 끊기면 아직 못 보낸 나머지는 유실된다.
 - **인증/암호화가 없다. E-Stop과 미션 launch까지 이 채널로 오간다는 점에서 이전보다 더 중요한 제약이 됐다.** 지금은 현장 로컬 Wi-Fi/AP 안에서만 쓰는 걸 전제로 한다. 같은 네트워크의 누구나 명령 프레임만 만들면 로봇을 정지시키거나 미션을 시작/종료시킬 수 있다. 인터넷 경유로 확장하거나 신뢰할 수 없는 네트워크에 노출하게 되면 이 앞단에 반드시 TLS(WSS)와 토큰 인증을 붙여야 한다.
 - **지도 origin 회전을 반영하지 않는다.** `origin.yaw`가 0이 아니면 프론트 마커 위치가 틀어진다.
-- **explore 미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite` subprocess의 핸들을 잃어버려서, 실제로는 떠 있는데 `stop_mission`으로 종료할 수 없는 상태가 될 수 있다. 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 것을 권장한다. (`return_home`은 subprocess가 아니라 서비스 호출이라 이 문제가 없다 — `return_home_node`는 `s2m_return_home_real.launch.py`로 이미 떠 있는 상태를 전제로 트리거/암 서비스만 부른다.)
+- **explore 미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite` subprocess의 핸들을 잃어버려서, 실제로는 떠 있는데 `stop_mission`으로 종료할 수 없는 상태가 될 수 있다. 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 것을 권장한다. (`return_home`은 subprocess가 아니라 서비스 호출이라 이 문제가 없다 — `return_home_node`는 `s2m_slam_real.launch.py use_return_home:=true`로 이미 떠 있는 상태를 전제로 트리거/암 서비스만 부른다.)
 - **서비스 호출 실패가 클라이언트에 전달되지 않는다.** `/drive/estop` 등이 응답 가능 상태가 아니면 서버 로그에만 경고가 남고, 웹 화면에는 별도 에러가 표시되지 않는다.
