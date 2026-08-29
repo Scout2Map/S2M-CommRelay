@@ -204,7 +204,7 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 | `reset_odom` | `/drive/reset_odom` (`std_srvs/Trigger`) 비동기 호출 |
 | `launch_mission` (`mission: explore`) | `ros2 launch explore_lite explore.launch.py` subprocess 시작, 이미 실행 중이면 무시하고 경고 로그 |
 | `launch_mission` (`mission: return_home`) | `/return_home/trigger`(`std_srvs/Trigger`) 비동기 호출 — subprocess를 새로 띄우는 게 아니라, 이미 `s2m_slam_real.launch.py use_return_home:=true`로 떠 있는 `return_home_node`에게 "지금 복귀 시작"을 지시하는 것이다. 응답이 `success: false`면 경고 로그만 남기고 넘어간다 |
-| `stop_mission` (`mission: explore`) | `explore_lite` subprocess `terminate()` + `explore_cmd_vel_topic`(기본 `/cmd_vel`)에 0속도 `Twist` 발행 + `navigate_action`(기본 `/navigate_to_pose`)의 `_action/cancel_goal` 서비스로 진행 중인 내비게이션 goal 취소 |
+| `stop_mission` (`mission: explore`) | `explore_lite` subprocess `terminate()`(핸들이 있으면) + `pkill -f explore_lite`(핸들이 없거나 stale해도 잡는 fallback) + `explore_cmd_vel_topic`(기본 `/cmd_vel`)에 0속도 `Twist` 발행 + `navigate_action`(기본 `/navigate_to_pose`)의 `_action/cancel_goal` 서비스로 진행 중인 내비게이션 goal 취소 |
 | `stop_mission` (`mission: return_home`) | `/return_home/arm`(`std_srvs/SetBool`, `data: false`) 비동기 호출로 disarm — `return_home_node`가 안전 정지 처리 |
 
 서비스가 0.5초 안에 응답 가능 상태가 아니면(`wait_for_service` 타임아웃) 경고만 로그로 남기고 넘어간다 — 호출 실패가 클라이언트에게 별도로 통보되지는 않는다.
@@ -313,5 +313,5 @@ ros2 launch scout2map_comm comm_relay.launch.py
 - **버퍼 전달과 clear 사이에 아주 작은 유실 창이 있다.** 클라이언트 접속 직후 버퍼를 비우고 전송을 시작하는데, 전송 도중 그 클라이언트가 바로 끊기면 아직 못 보낸 나머지는 유실된다.
 - **인증/암호화가 없다. E-Stop과 미션 launch까지 이 채널로 오간다는 점에서 이전보다 더 중요한 제약이 됐다.** 지금은 현장 로컬 Wi-Fi/AP 안에서만 쓰는 걸 전제로 한다. 같은 네트워크의 누구나 명령 프레임만 만들면 로봇을 정지시키거나 미션을 시작/종료시킬 수 있다. 인터넷 경유로 확장하거나 신뢰할 수 없는 네트워크에 노출하게 되면 이 앞단에 반드시 TLS(WSS)와 토큰 인증을 붙여야 한다.
 - **지도 origin 회전을 반영하지 않는다.** `origin.yaw`가 0이 아니면 프론트 마커 위치가 틀어진다.
-- **explore 미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite` subprocess의 핸들을 잃어버려서, 실제로는 떠 있는데 `stop_mission`으로 종료할 수 없는 상태가 될 수 있다. 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 것을 권장한다. (`return_home`은 subprocess가 아니라 서비스 호출이라 이 문제가 없다 — `return_home_node`는 `s2m_slam_real.launch.py use_return_home:=true`로 이미 떠 있는 상태를 전제로 트리거/암 서비스만 부른다.)
+- **explore 미션 subprocess 추적이 프로세스 핸들 하나뿐이다.** `comm_relay_node`가 재시작되면 이전에 띄운 `explore_lite` subprocess의 핸들을 잃어버린다. `stop_mission`(explore)은 이제 그 경우를 대비해 `pkill -f explore_lite`로 프로세스 이름 기준 fallback을 같이 시도하므로(2026-08-29) 완전히 종료 불가능한 상태는 아니지만, 핸들을 잃은 상태에서는 "정상 종료했다"는 `Terminated explore_lite mission` 로그 없이 이 fallback 경고 로그만 남는다는 차이가 있다. 그래도 노드 재시작 전에는 실행 중인 미션을 먼저 종료하는 걸 권장한다. (`return_home`은 subprocess가 아니라 서비스 호출이라 이 문제가 없다 — `return_home_node`는 `s2m_slam_real.launch.py use_return_home:=true`로 이미 떠 있는 상태를 전제로 트리거/암 서비스만 부른다.)
 - **서비스 호출 실패가 클라이언트에 전달되지 않는다.** `/drive/estop` 등이 응답 가능 상태가 아니면 서버 로그에만 경고가 남고, 웹 화면에는 별도 에러가 표시되지 않는다.

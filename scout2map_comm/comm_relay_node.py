@@ -440,6 +440,21 @@ class CommRelayNode(Node):
             self._explore_process = None
             self.get_logger().info('Terminated explore_lite mission')
 
+        # comm_relay only tracks ONE subprocess handle for the lifetime of
+        # this node instance (documented limitation, see README known
+        # limitations). If comm_relay itself was restarted after
+        # launch_mission - or the handle is stale for any other reason -
+        # the branch above silently does nothing and explore_lite keeps
+        # running: it will just pick a new frontier and send a fresh
+        # NavigateToPose goal the moment the one _cancel_active_navigation
+        # cancels below is cleared, making stop_mission look like it did
+        # nothing (2026-08-29: cancel succeeded and the robot briefly
+        # stopped, but a new goal appeared ~5s later - no "Terminated
+        # explore_lite mission" log at all, meaning the handle branch above
+        # never ran that time). Kill it by process name as a fallback so
+        # this is never a silent no-op regardless of handle state.
+        self._kill_stray_explore_processes()
+
         # send zero velocity to cancel active momentum and stop immediately
         stop_cmd = Twist()
         self._stop_pub.publish(stop_cmd)
@@ -453,6 +468,27 @@ class CommRelayNode(Node):
         self._cancel_active_navigation()
 
         self._broadcast_mission_status('IDLE')
+
+    def _kill_stray_explore_processes(self):
+        try:
+            result = subprocess.run(
+                ['pkill', '-f', 'explore_lite'],
+                capture_output=True, timeout=2.0)
+        except Exception as exc:
+            self.get_logger().error(f'failed to pkill stray explore_lite process(es): {exc}')
+            return
+
+        # pkill returns 1 when nothing matched - the common, expected case
+        # once the handle-based terminate() above already did its job.
+        # Only 0 (something was actually killed here, meaning the handle
+        # was stale) is worth a log line; anything else is a real error.
+        if result.returncode == 0:
+            self.get_logger().warn(
+                'killed stray explore_lite process(es) by name - comm_relay '
+                'had no live subprocess handle for them')
+        elif result.returncode not in (0, 1):
+            stderr = result.stderr.decode(errors='replace').strip()
+            self.get_logger().warn(f'pkill -f explore_lite exited {result.returncode}: {stderr}')
 
     def _cancel_active_navigation(self):
         if not self._navigate_cancel_client.wait_for_service(timeout_sec=0.5):
