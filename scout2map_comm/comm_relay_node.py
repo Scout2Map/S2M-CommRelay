@@ -18,7 +18,7 @@ from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import BatteryState
-from scout2map_msgs.msg import DriveStatus
+from scout2map_msgs.msg import DriveStatus, SensorStatus
 from std_msgs.msg import String
 from std_srvs.srv import SetBool, Trigger
 
@@ -64,6 +64,12 @@ class CommRelayNode(Node):
         self.declare_parameter('drive_status_topic', '/drive/status')
         self.declare_parameter('telemetry_relay_period_s', 10.0)
 
+        # Pico sensor-fusion MCU link/presence, published by sensor_bridge.
+        # Surfaced the same way as drive_status so an operator sees a dead
+        # or never-initialized sensor (e.g. BH1750 not answering on I2C)
+        # without SSHing in and running ros2 topic echo.
+        self.declare_parameter('sensor_status_topic', '/sensors/status')
+
         # Return-home goal, so the operator can see where the robot is
         # headed instead of just the state text. Both topics are published
         # by return_home_node with TRANSIENT_LOCAL/RELIABLE QoS (latched) -
@@ -98,6 +104,7 @@ class CommRelayNode(Node):
         self._battery_topic = self.get_parameter('battery_topic').value
         self._drive_status_topic = self.get_parameter('drive_status_topic').value
         self._telemetry_relay_period_s = float(self.get_parameter('telemetry_relay_period_s').value)
+        self._sensor_status_topic = self.get_parameter('sensor_status_topic').value
 
         self._return_home_pose_topic = self.get_parameter('return_home_pose_topic').value
         self._return_home_status_topic = self.get_parameter('return_home_status_topic').value
@@ -107,6 +114,7 @@ class CommRelayNode(Node):
         self._telemetry_lock = threading.Lock()
         self._latest_battery_payload = None
         self._latest_drive_status_payload = None
+        self._latest_sensor_status_payload = None
 
         # Cached so a client that connects after the last publish (both
         # topics are latched, but that only guarantees comm_relay's own
@@ -160,6 +168,8 @@ class CommRelayNode(Node):
             BatteryState, self._battery_topic, self._on_battery, 10)
         self._drive_status_sub = self.create_subscription(
             DriveStatus, self._drive_status_topic, self._on_drive_status, 10)
+        self._sensor_status_sub = self.create_subscription(
+            SensorStatus, self._sensor_status_topic, self._on_sensor_status, 10)
 
         # ROS 2 Service Clients for Drive Controls
         self._cli_estop = self.create_client(Trigger, '/drive/estop')
@@ -512,6 +522,35 @@ class CommRelayNode(Node):
         except Exception as exc:
             self.get_logger().error(f'Error parsing /drive/status msg: {exc}')
 
+    def _on_sensor_status(self, msg: SensorStatus):
+        """scout2map_msgs/msg/SensorStatus 토픽 콜백 -> 최신 데이터 저장
+
+        sensor_bridge가 보는 Pico 센서-퓨전 MCU 링크/센서 인식 상태. 이걸
+        놓치면 (2026-08-29 BH1750 미인식 사례처럼) 조도 센서가 부팅 때부터
+        한 번도 값을 못 보냈는데도 event_engine 쪽에서는 조용히
+        illuminance_valid=false로만 남아 SSH 없이는 알아챌 방법이 없었다.
+        """
+        try:
+            payload = json.dumps({
+                'kind': 'sensor_mcu_status',
+                'data': {
+                    'port_open': bool(msg.port_open),
+                    'link_ok': bool(msg.link_ok),
+                    'last_line_age_s': round(float(msg.last_line_age_s), 2),
+                    'mcu_reboot_count': msg.mcu_reboot_count,
+                    'parse_errors': msg.parse_errors,
+                    'framing_overflows': msg.framing_overflows,
+                    'aht21_present': bool(msg.aht21_present),
+                    'ens160_present': bool(msg.ens160_present),
+                    'bh1750_present': bool(msg.bh1750_present),
+                    'pms7003_seen': bool(msg.pms7003_seen),
+                }
+            })
+            with self._telemetry_lock:
+                self._latest_sensor_status_payload = payload
+        except Exception as exc:
+            self.get_logger().error(f'Error parsing /sensors/status msg: {exc}')
+
     def _broadcast_robot_pose(self):
         with self._buffer_lock:
             if not self._ws_clients:
@@ -552,13 +591,17 @@ class CommRelayNode(Node):
         with self._telemetry_lock:
             batt_payload = self._latest_battery_payload
             status_payload = self._latest_drive_status_payload
+            sensor_payload = self._latest_sensor_status_payload
             self._latest_battery_payload = None
             self._latest_drive_status_payload = None
+            self._latest_sensor_status_payload = None
 
         if batt_payload:
             asyncio.run_coroutine_threadsafe(self._broadcast(batt_payload), self._loop)
         if status_payload:
             asyncio.run_coroutine_threadsafe(self._broadcast(status_payload), self._loop)
+        if sensor_payload:
+            asyncio.run_coroutine_threadsafe(self._broadcast(sensor_payload), self._loop)
 
     def _next_seq(self):
         with self._buffer_lock:

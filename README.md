@@ -129,7 +129,27 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 ```
 `/drive/status`(`scout2map_msgs/DriveStatus`) 구독값을 그대로 옮긴다.
 
-배터리/드라이브 상태 둘 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins).
+**센서 MCU 상태 (sensor_mcu_status):**
+```json
+{
+  "kind": "sensor_mcu_status",
+  "data": {
+    "port_open": true,
+    "link_ok": true,
+    "last_line_age_s": 0.12,
+    "mcu_reboot_count": 0,
+    "parse_errors": 0,
+    "framing_overflows": 0,
+    "aht21_present": true,
+    "ens160_present": true,
+    "bh1750_present": true,
+    "pms7003_seen": true
+  }
+}
+```
+`/sensors/status`(`scout2map_msgs/SensorStatus`, Pico 센서-퓨전 MCU를 잇는 `sensor_bridge`가 발행)를 그대로 옮긴다. `*_present`/`pms7003_seen`은 MCU 부팅 배너로 초기화된 뒤 실제 데이터로 확정되는 값이라, 한 번도 값을 못 보낸 센서(2026-08-29 BH1750 미인식 사례처럼 배선/I2C 주소 문제로 부팅 시 초기화 자체가 실패한 경우)를 운영자가 `ros2 topic echo` 없이 바로 알아챌 수 있게 해준다. `EnvSnapshot`의 `*_valid` 플래그는 "값이 있는데 오래됐다"만 구분하고 "애초에 값이 온 적 없다"는 구분하지 못하므로, 이 상태는 `EnvSnapshot`이 아니라 `SensorStatus`에서만 확인 가능하다.
+
+배터리/드라이브/센서 MCU 상태 셋 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins).
 
 **미션 상태 (mission_status):**
 ```json
@@ -208,7 +228,8 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `pose_relay_period_s` | `0.1` | 로봇 위치 broadcast 주기 |
 | `battery_topic` | `/drive/battery` | 구독할 배터리 토픽 (`sensor_msgs/BatteryState`) |
 | `drive_status_topic` | `/drive/status` | 구독할 드라이브 상태 토픽 (`scout2map_msgs/DriveStatus`) |
-| `telemetry_relay_period_s` | `10.0` | 배터리/드라이브 상태 broadcast 주기, 클라이언트 연결 시에만 |
+| `sensor_status_topic` | `/sensors/status` | 구독할 센서 MCU 상태 토픽 (`scout2map_msgs/SensorStatus`) |
+| `telemetry_relay_period_s` | `10.0` | 배터리/드라이브/센서 MCU 상태 broadcast 주기, 클라이언트 연결 시에만 |
 | `return_home_pose_topic` | `/return_home/start_pose` | 구독할 복귀 시작 위치 토픽 (`geometry_msgs/PoseStamped`, latched) |
 | `return_home_status_topic` | `/return_home/status` | 구독할 복귀 상태 토픽 (`std_msgs/String` JSON, latched) |
 | `explore_cmd_vel_topic` | `/cmd_vel` | `stop_mission`(explore)에서 0속도 `Twist`를 발행할 토픽 |
@@ -225,7 +246,7 @@ source install/setup.bash
 ros2 launch scout2map_comm comm_relay.launch.py
 ```
 
-의존 패키지: `rclpy`, `std_msgs`, `nav_msgs`, `geometry_msgs`(PoseStamped/Twist), `sensor_msgs`, `std_srvs`, `tf2_ros`, `scout2map_msgs`(DriveStatus 메시지 정의), `websockets`(python3-websockets). 전부 `package.xml`에 `<depend>`로 선언돼 있어서 `rosdep install`로 해결된다.
+의존 패키지: `rclpy`, `std_msgs`, `nav_msgs`, `geometry_msgs`(PoseStamped/Twist), `sensor_msgs`, `std_srvs`, `tf2_ros`, `scout2map_msgs`(DriveStatus/SensorStatus 메시지 정의), `websockets`(python3-websockets). 전부 `package.xml`에 `<depend>`로 선언돼 있어서 `rosdep install`로 해결된다.
 
 ## 테스트 방법
 
