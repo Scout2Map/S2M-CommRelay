@@ -114,7 +114,7 @@ class CommRelayNode(Node):
         # Drive Status & Battery topics
         self.declare_parameter('battery_topic', '/drive/battery')
         self.declare_parameter('drive_status_topic', '/drive/status')
-        self.declare_parameter('telemetry_relay_period_s', 10.0)
+        self.declare_parameter('telemetry_relay_period_s', 5.0)
 
         # Pico sensor-fusion MCU link/presence, published by sensor_bridge.
         # Surfaced the same way as drive_status so an operator sees a dead
