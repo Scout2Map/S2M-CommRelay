@@ -578,6 +578,25 @@ class CommRelayNode(Node):
         self._broadcast_mission_status('IDLE')
 
     def _kill_stray_explore_processes(self):
+        # subprocess.run(..., timeout=2.0) blocks whatever thread calls it,
+        # and this used to run straight from the stop_mission websocket
+        # handler - which executes on rclpy.spin()'s single-threaded
+        # executor (main()). While pkill blocked, EVERYTHING else on this
+        # node stalled too, including the /control/heartbeat timer. On a
+        # loaded SBC that stall can eat into the heartbeat consumers' own
+        # timeout budget (event_engine COMM_DEGRADED 1.5s, return_home
+        # heartbeat_timeout_sec 3.0s) at the exact moment an operator
+        # presses stop, making return_home read a stop-mission press as a
+        # comms glitch and react on its own instead of the robot actually
+        # stopping cleanly (2026-08-30). Run it on a throwaway thread
+        # instead - same pattern as the websocket server's own background
+        # thread above (see the "never blocks rclpy.spin()" comment) - so
+        # the callback returns immediately and the result is just logged
+        # whenever pkill actually finishes.
+        threading.Thread(
+            target=self._run_pkill_explore_lite, daemon=True).start()
+
+    def _run_pkill_explore_lite(self):
         try:
             result = subprocess.run(
                 ['pkill', '-f', 'explore_lite'],
