@@ -17,6 +17,8 @@ from action_msgs.srv import CancelGoal
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import BatteryState
@@ -36,6 +38,43 @@ except ImportError as exc:
         "the 'websockets' package is required, install it with "
         "'pip install websockets --break-system-packages' or via rosdep"
     ) from exc
+
+
+# Parameters exposed to the web settings panel, keyed by an internal node
+# key (comm_relay resolves the actual ROS node name via the *_node_name
+# parameters below, same pattern as every other topic/service name in this
+# file). Deliberately excludes anything safety/timing critical - heartbeat,
+# drive-link and TF timeouts, comm-loss gating, rough-terrain/rotation
+# calibration constants, the enable_*_events toggles - because a live web
+# control that can loosen a fail-safe mid-mission is a hazard the launch
+# file audit trail does not have (2026-08-30).
+SETTABLE_PARAMS = {
+    'scout_vision': {
+        'confidence_threshold': {'type': 'double', 'min': 0.05, 'max': 0.95},
+        'nms_threshold': {'type': 'double', 'min': 0.05, 'max': 0.95},
+        'max_fps': {'type': 'double', 'min': 0.5, 'max': 15.0},
+    },
+    'event_engine': {
+        'event_repeat_interval_s': {'type': 'double', 'min': 1.0, 'max': 120.0},
+        'vision_confidence_threshold': {'type': 'double', 'min': 0.05, 'max': 0.95},
+        'vision_min_consecutive_frames': {'type': 'integer', 'min': 1, 'max': 10},
+        'vision_event_cooldown_s': {'type': 'double', 'min': 0.5, 'max': 60.0},
+        'prediction_event_cooldown_s': {'type': 'double', 'min': 1.0, 'max': 300.0},
+        'publish_clear_events': {'type': 'bool'},
+    },
+}
+
+
+def _param_value_to_py(pv: ParameterValue):
+    if pv.type == ParameterType.PARAMETER_BOOL:
+        return pv.bool_value
+    if pv.type == ParameterType.PARAMETER_INTEGER:
+        return pv.integer_value
+    if pv.type == ParameterType.PARAMETER_DOUBLE:
+        return pv.double_value
+    if pv.type == ParameterType.PARAMETER_STRING:
+        return pv.string_value
+    return None
 
 
 class CommRelayNode(Node):
@@ -118,6 +157,16 @@ class CommRelayNode(Node):
         # path to controller" (2026-08-29).
         self.declare_parameter('navigate_action', '/navigate_to_pose')
 
+        # Settings panel: threshold read/write plus the SETTABLE_PARAMS
+        # allowlist above, resolved into per-node get/set_parameters
+        # service names below (every rclpy node exposes these
+        # automatically for its declare_parameter() calls, so no changes
+        # were needed on the scout_vision/event_engine side for this part).
+        self.declare_parameter('threshold_topic', '/threshold/set')
+        self.declare_parameter('threshold_get_all_service', '/threshold/get_all')
+        self.declare_parameter('vision_node_name', 'scout_vision')
+        self.declare_parameter('event_engine_node_name', 'event_engine')
+
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
         self._ws_port = int(self.get_parameter('ws_port').value)
@@ -150,6 +199,14 @@ class CommRelayNode(Node):
 
         self._explore_cmd_vel_topic = self.get_parameter('explore_cmd_vel_topic').value
         self._navigate_action = self.get_parameter('navigate_action').value
+
+        self._threshold_topic = self.get_parameter('threshold_topic').value
+        self._threshold_get_all_service = self.get_parameter(
+            'threshold_get_all_service').value
+        self._node_names = {
+            'scout_vision': self.get_parameter('vision_node_name').value,
+            'event_engine': self.get_parameter('event_engine_node_name').value,
+        }
 
         self._telemetry_lock = threading.Lock()
         self._latest_battery_payload = None
@@ -223,6 +280,25 @@ class CommRelayNode(Node):
         # ROS 2 Service Clients for Return-Home Controls
         self._cli_return_trigger = self.create_client(Trigger, '/return_home/trigger')
         self._cli_return_arm = self.create_client(SetBool, '/return_home/arm')
+
+        # Settings panel: same fire-and-forget publish path an operator's
+        # own /threshold/set publisher would use (event_engine's
+        # threshold_callback does not care who published it), plus one
+        # get/set_parameters client pair per SETTABLE_PARAMS entry -
+        # standard services rclpy exposes automatically for every declared
+        # parameter, so nothing new was needed on those nodes for this part.
+        self._threshold_pub = self.create_publisher(String, self._threshold_topic, 10)
+        self._cli_threshold_get_all = self.create_client(
+            Trigger, self._threshold_get_all_service)
+        self._param_clients = {}
+        for node_key in SETTABLE_PARAMS:
+            ros_node_name = self._node_names[node_key]
+            self._param_clients[node_key] = {
+                'get': self.create_client(
+                    GetParameters, f'/{ros_node_name}/get_parameters'),
+                'set': self.create_client(
+                    SetParameters, f'/{ros_node_name}/set_parameters'),
+            }
 
         # zero-velocity publisher used by _stop_explore_mission
         self._stop_pub = self.create_publisher(Twist, self._explore_cmd_vel_topic, 10)
@@ -362,9 +438,17 @@ class CommRelayNode(Node):
             if latest_status is not None:
                 await self._send_frames(websocket, [latest_status])
 
+            # Same "catch up a new joiner immediately" idea as the map and
+            # return-home pushes above - an operator opening the settings
+            # panel should see current thresholds/params right away rather
+            # than waiting on a get_settings round trip. Sent to just this
+            # client (not broadcast) so it doesn't spam others already
+            # connected.
+            self._fetch_and_broadcast_settings(target=websocket)
+
             # Process Inbound Websocket Messages (Commands from Web Monitoring)
             async for raw_inbound in websocket:
-                await self._handle_inbound_message(raw_inbound)
+                await self._handle_inbound_message(raw_inbound, websocket)
 
         except (ConnectionClosed, OSError):
             pass
@@ -378,7 +462,7 @@ class CommRelayNode(Node):
                     self._last_client_seen_mono = time.monotonic()
                     self._link_state = 'lost'
 
-    async def _handle_inbound_message(self, raw_msg):
+    async def _handle_inbound_message(self, raw_msg, websocket=None):
         """Web UI로부터 들어온 command 수신 처리"""
         try:
             msg = json.loads(raw_msg)
@@ -411,6 +495,30 @@ class CommRelayNode(Node):
                     self._stop_explore_mission()
                 elif mission == 'return_home':
                     self._stop_return_mission()
+
+            # settings panel commands (thresholds + the SETTABLE_PARAMS
+            # allowlist) - get_settings re-sends to just the asking client,
+            # the two setters broadcast the refreshed state to everyone
+            # once the change is confirmed, so every open panel stays in
+            # sync rather than only the one that made the edit.
+            elif cmd == 'get_settings':
+                self._fetch_and_broadcast_settings(target=websocket)
+            elif cmd == 'set_threshold':
+                event_type = msg.get('type')
+                level = msg.get('level', 'warning')
+                value = msg.get('value')
+                if event_type is not None and value is not None:
+                    self._set_threshold(event_type, level, value)
+                else:
+                    self.get_logger().warn(f'set_threshold rejected: missing type/value in {msg}')
+            elif cmd == 'set_param':
+                node_key = msg.get('node')
+                param_name = msg.get('param')
+                value = msg.get('value')
+                if node_key is not None and param_name is not None and value is not None:
+                    self._set_node_param(node_key, param_name, value)
+                else:
+                    self.get_logger().warn(f'set_param rejected: missing node/param/value in {msg}')
 
         except Exception as exc:
             self.get_logger().error(f'Error processing inbound websocket message: {exc}')
@@ -558,6 +666,166 @@ class CommRelayNode(Node):
     def _broadcast_mission_status(self, status):
         msg = json.dumps({'kind': 'mission_status', 'mission': status})
         asyncio.run_coroutine_threadsafe(self._broadcast(msg), self._loop)
+
+    def _set_threshold(self, event_type, level, value):
+        # Reuses the same /threshold/set fire-and-forget path an operator's
+        # own publisher would use - event_engine's threshold_callback does
+        # the actual type/level/value validation and does not care who
+        # published it, so comm_relay does no validation of its own here.
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            self.get_logger().warn(f'set_threshold rejected: {value!r} is not a number')
+            return
+
+        self._threshold_pub.publish(String(data=json.dumps({
+            'type': event_type,
+            'level': level,
+            'value': value,
+        })))
+        self.get_logger().info(f'threshold set requested: {event_type}/{level} = {value}')
+
+        # The publish above is fire-and-forget with no reply, so give
+        # event_engine's subscription callback a moment to actually apply
+        # it before reading it back - threading.Timer rather than an
+        # asyncio call, since this runs on the asyncio loop thread and
+        # scheduling loop callbacks from here would need call_soon (not
+        # call_later's cross-thread-safe cousin, which is call_soon_threadsafe;
+        # a plain stdlib timer sidesteps the distinction entirely).
+        threading.Timer(0.3, self._fetch_and_broadcast_settings).start()
+
+    def _set_node_param(self, node_key, param_name, value):
+        allowed = SETTABLE_PARAMS.get(node_key)
+        if allowed is None or param_name not in allowed:
+            self.get_logger().warn(
+                f'set_param rejected: {node_key}.{param_name} is not in the allowlist')
+            return
+
+        bounds = allowed[param_name]
+        pv = ParameterValue()
+        try:
+            if bounds['type'] == 'bool':
+                pv.type = ParameterType.PARAMETER_BOOL
+                pv.bool_value = bool(value)
+            elif bounds['type'] == 'integer':
+                value = int(value)
+                if not (bounds['min'] <= value <= bounds['max']):
+                    raise ValueError(f'out of range [{bounds["min"]}, {bounds["max"]}]')
+                pv.type = ParameterType.PARAMETER_INTEGER
+                pv.integer_value = value
+            elif bounds['type'] == 'double':
+                value = float(value)
+                if not (bounds['min'] <= value <= bounds['max']):
+                    raise ValueError(f'out of range [{bounds["min"]}, {bounds["max"]}]')
+                pv.type = ParameterType.PARAMETER_DOUBLE
+                pv.double_value = value
+            else:
+                raise ValueError(f'unknown allowlist type: {bounds["type"]}')
+        except (TypeError, ValueError) as exc:
+            self.get_logger().warn(
+                f'set_param rejected: {node_key}.{param_name} = {value!r} ({exc})')
+            return
+
+        client = self._param_clients[node_key]['set']
+        if not client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warn(f'{node_key} set_parameters service is not available!')
+            return
+
+        req = SetParameters.Request()
+        req.parameters = [Parameter(name=param_name, value=pv)]
+        future = client.call_async(req)
+
+        def _on_set_done(f):
+            try:
+                res = f.result()
+                ok = bool(res.results) and res.results[0].successful
+                if ok:
+                    self.get_logger().info(f'{node_key}.{param_name} set to {value}')
+                else:
+                    reason = res.results[0].reason if res.results else 'no result returned'
+                    self.get_logger().warn(
+                        f'{node_key}.{param_name} rejected by node: {reason}')
+            except Exception as exc:
+                self.get_logger().error(f'{node_key} set_parameters call failed: {exc}')
+            finally:
+                # SetParameters only replies after the node applies it, so
+                # unlike _set_threshold's fire-and-forget publish, a
+                # re-fetch right here (still on the executor thread that
+                # just processed the reply) already sees the new value -
+                # no race, no delay needed.
+                self._fetch_and_broadcast_settings()
+
+        future.add_done_callback(_on_set_done)
+
+    def _fetch_and_broadcast_settings(self, target=None):
+        """Fetches current thresholds + every SETTABLE_PARAMS value, then
+        sends one 'settings' envelope - to just `target` when a single
+        client is catching up (new connection, get_settings), or broadcast
+        to everyone once a set_threshold/set_param command changes
+        something, so every open panel stays in sync."""
+        result = {'thresholds': None, 'params': {}}
+        pending = {'count': 1 + len(SETTABLE_PARAMS)}
+        pending_lock = threading.Lock()
+
+        def _maybe_finish():
+            with pending_lock:
+                pending['count'] -= 1
+                done = pending['count'] <= 0
+            if not done:
+                return
+            envelope = json.dumps({'kind': 'settings', 'data': result})
+            if target is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_frames(target, [envelope]), self._loop)
+            else:
+                asyncio.run_coroutine_threadsafe(self._broadcast(envelope), self._loop)
+
+        if self._cli_threshold_get_all.wait_for_service(timeout_sec=0.5):
+            future = self._cli_threshold_get_all.call_async(Trigger.Request())
+
+            def _on_threshold_done(f):
+                try:
+                    res = f.result()
+                    if res.success:
+                        result['thresholds'] = json.loads(res.message)
+                    else:
+                        self.get_logger().warn(f'/threshold/get_all failed: {res.message}')
+                except Exception as exc:
+                    self.get_logger().error(f'/threshold/get_all call failed: {exc}')
+                finally:
+                    _maybe_finish()
+
+            future.add_done_callback(_on_threshold_done)
+        else:
+            self.get_logger().warn('/threshold/get_all service is not available!')
+            _maybe_finish()
+
+        for node_key, params in SETTABLE_PARAMS.items():
+            client = self._param_clients[node_key]['get']
+            param_names = list(params.keys())
+
+            if not client.wait_for_service(timeout_sec=0.5):
+                self.get_logger().warn(f'{node_key} get_parameters service is not available!')
+                _maybe_finish()
+                continue
+
+            req = GetParameters.Request()
+            req.names = param_names
+            future = client.call_async(req)
+
+            def _on_params_done(f, node_key=node_key, param_names=param_names):
+                try:
+                    res = f.result()
+                    result['params'][node_key] = {
+                        name: _param_value_to_py(val)
+                        for name, val in zip(param_names, res.values)
+                    }
+                except Exception as exc:
+                    self.get_logger().error(f'{node_key} get_parameters call failed: {exc}')
+                finally:
+                    _maybe_finish()
+
+            future.add_done_callback(_on_params_done)
 
     async def _send_frames(self, client, frames):
         # Sends every frame in the list under that client's own lock, so a
