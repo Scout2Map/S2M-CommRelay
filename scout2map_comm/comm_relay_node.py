@@ -224,6 +224,13 @@ class CommRelayNode(Node):
         self.declare_parameter('vision_node_name', 'scout_vision')
         self.declare_parameter('event_engine_node_name', 'event_engine')
 
+        # GPIO event-output settings panel: same fire-and-forget +
+        # Trigger-readback shape as the threshold pair above, pointed at
+        # S2M-MCU-BridgeNode's gpio_events node instead of event_engine
+        # (2026-08-31).
+        self.declare_parameter('gpio_config_topic', '/gpio_events/config_set')
+        self.declare_parameter('gpio_get_all_service', '/gpio_events/get_all')
+
         self._events_topic = self.get_parameter('events_topic').value
         self._ws_host = self.get_parameter('ws_host').value
         self._ws_port = int(self.get_parameter('ws_port').value)
@@ -262,6 +269,9 @@ class CommRelayNode(Node):
         self._threshold_topic = self.get_parameter('threshold_topic').value
         self._threshold_get_all_service = self.get_parameter(
             'threshold_get_all_service').value
+        self._gpio_config_topic = self.get_parameter('gpio_config_topic').value
+        self._gpio_get_all_service = self.get_parameter(
+            'gpio_get_all_service').value
         self._node_names = {
             'scout_vision': self.get_parameter('vision_node_name').value,
             'event_engine': self.get_parameter('event_engine_node_name').value,
@@ -373,6 +383,17 @@ class CommRelayNode(Node):
         self._threshold_pub = self.create_publisher(String, self._threshold_topic, 10)
         self._cli_threshold_get_all = self.create_client(
             Trigger, self._threshold_get_all_service)
+
+        # GPIO event-output settings panel: gpio_events subscribes to the
+        # config topic (fire-and-forget add/remove) and exposes get_all as a
+        # Trigger, exactly like threshold above - no per-node parameter
+        # client pair needed since this is a dynamic list, not a fixed
+        # SETTABLE_PARAMS-style parameter set.
+        self._gpio_config_pub = self.create_publisher(
+            String, self._gpio_config_topic, 10)
+        self._cli_gpio_get_all = self.create_client(
+            Trigger, self._gpio_get_all_service)
+
         self._param_clients = {}
         for node_key in SETTABLE_PARAMS:
             ros_node_name = self._node_names[node_key]
@@ -619,6 +640,26 @@ class CommRelayNode(Node):
                 else:
                     self.get_logger().warn(f'set_param rejected: missing node/param/value in {msg}')
 
+            # GPIO event-output settings panel commands - same
+            # fire-and-forget-then-refetch pattern as set_threshold, aimed
+            # at gpio_events' /gpio_events/config_set instead.
+            elif cmd == 'gpio_add_mapping':
+                event_type = msg.get('type')
+                pin = msg.get('pin')
+                mode = msg.get('mode')
+                label = msg.get('label', '')
+                if event_type is not None and pin is not None and mode is not None:
+                    self._add_gpio_mapping(event_type, pin, mode, label)
+                else:
+                    self.get_logger().warn(
+                        f'gpio_add_mapping rejected: missing type/pin/mode in {msg}')
+            elif cmd == 'gpio_remove_mapping':
+                mapping_id = msg.get('id')
+                if mapping_id is not None:
+                    self._remove_gpio_mapping(mapping_id)
+                else:
+                    self.get_logger().warn(f'gpio_remove_mapping rejected: missing id in {msg}')
+
         except Exception as exc:
             self.get_logger().error(f'Error processing inbound websocket message: {exc}')
 
@@ -812,6 +853,44 @@ class CommRelayNode(Node):
         # a plain stdlib timer sidesteps the distinction entirely).
         threading.Timer(0.3, self._fetch_and_broadcast_settings).start()
 
+    def _add_gpio_mapping(self, event_type, pin, mode, label):
+        # gpio_event_node validates mode/pin itself and just logs+drops a
+        # bad request (its config_set channel is fire-and-forget, same as
+        # /threshold/set), so comm_relay only checks pin is an int here -
+        # anything else would silently fail server-side with no way for
+        # this operator's click to surface why.
+        try:
+            pin = int(pin)
+        except (TypeError, ValueError):
+            self.get_logger().warn(f'gpio_add_mapping rejected: {pin!r} is not an integer pin')
+            return
+
+        self._gpio_config_pub.publish(String(data=json.dumps({
+            'action': 'add',
+            'event_type': event_type,
+            'pin': pin,
+            'mode': mode,
+            'label': label,
+        })))
+        self.get_logger().info(
+            f'gpio mapping add requested: {event_type} -> pin {pin} ({mode})')
+        threading.Timer(0.3, self._fetch_and_broadcast_settings).start()
+
+    def _remove_gpio_mapping(self, mapping_id):
+        try:
+            mapping_id = int(mapping_id)
+        except (TypeError, ValueError):
+            self.get_logger().warn(
+                f'gpio_remove_mapping rejected: {mapping_id!r} is not an integer id')
+            return
+
+        self._gpio_config_pub.publish(String(data=json.dumps({
+            'action': 'remove',
+            'id': mapping_id,
+        })))
+        self.get_logger().info(f'gpio mapping remove requested: id={mapping_id}')
+        threading.Timer(0.3, self._fetch_and_broadcast_settings).start()
+
     def _set_node_param(self, node_key, param_name, value):
         allowed = SETTABLE_PARAMS.get(node_key)
         if allowed is None or param_name not in allowed:
@@ -982,8 +1061,8 @@ class CommRelayNode(Node):
         client is catching up (new connection, get_settings), or broadcast
         to everyone once a set_threshold/set_param command changes
         something, so every open panel stays in sync."""
-        result = {'thresholds': None, 'params': {}}
-        pending = {'count': 1 + len(SETTABLE_PARAMS)}
+        result = {'thresholds': None, 'params': {}, 'gpio_mappings': None}
+        pending = {'count': 2 + len(SETTABLE_PARAMS)}
         pending_lock = threading.Lock()
 
         def _maybe_finish():
@@ -1017,6 +1096,30 @@ class CommRelayNode(Node):
             future.add_done_callback(_on_threshold_done)
         else:
             self.get_logger().warn('/threshold/get_all service is not available!')
+            _maybe_finish()
+
+        if self._cli_gpio_get_all.wait_for_service(timeout_sec=0.5):
+            future = self._cli_gpio_get_all.call_async(Trigger.Request())
+
+            def _on_gpio_done(f):
+                try:
+                    res = f.result()
+                    if res.success:
+                        result['gpio_mappings'] = json.loads(res.message)
+                    else:
+                        self.get_logger().warn(f'/gpio_events/get_all failed: {res.message}')
+                except Exception as exc:
+                    self.get_logger().error(f'/gpio_events/get_all call failed: {exc}')
+                finally:
+                    _maybe_finish()
+
+            future.add_done_callback(_on_gpio_done)
+        else:
+            # gpio_events is an optional node (not every deployment has GPIO
+            # loads wired up) - a missing service just leaves gpio_mappings
+            # null in the settings envelope rather than blocking the rest of
+            # the panel from refreshing.
+            self.get_logger().warn('/gpio_events/get_all service is not available!')
             _maybe_finish()
 
         for node_key, params in SETTABLE_PARAMS.items():
