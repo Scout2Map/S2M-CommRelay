@@ -52,3 +52,20 @@ comm_relay:
     # explore_lite's own cmd_vel output. _stop_explore_mission publishes a
     # zero-velocity Twist here on stop, on top of killing the subprocess.
     explore_cmd_vel_topic: /cmd_vel
+
+    # Link-quality auto-adjust: pings the connected web client every
+    # link_quality_check_period_s and measures round-trip time. Crossing
+    # link_rtt_degraded_ms for link_quality_hysteresis_checks consecutive
+    # checks pushes scout_vision to LINK_QUALITY_PROFILES['degraded']
+    # (lower max_fps + smaller/lower-quality snapshots, see
+    # comm_relay_node.py) and stretches this node's own telemetry
+    # broadcast period out to telemetry_relay_period_s_degraded; dropping
+    # back under link_rtt_good_ms for the same number of checks restores
+    # 'good'. Widen the good/degraded gap if the tier flaps on a marginal
+    # link, or shorten link_quality_check_period_s to react faster at the
+    # cost of a slightly heavier ping load on the link itself.
+    link_quality_check_period_s: 2.0
+    link_rtt_good_ms: 250.0
+    link_rtt_degraded_ms: 800.0
+    link_quality_hysteresis_checks: 2
+    telemetry_relay_period_s_degraded: 15.0

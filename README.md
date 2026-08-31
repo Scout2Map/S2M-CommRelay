@@ -167,7 +167,20 @@ roslibjs/rosbridge 방식이 아니라 브라우저 기본 `WebSocket` API만으
 ```
 `diagnostics_topic`(기본 `/diagnostics`, `diagnostic_msgs/DiagnosticArray`)를 구독하되, `vision_diagnostic_name`(기본 `scout_vision/inference`)과 이름이 일치하는 항목 하나만 골라서 옮긴다 — `/diagnostics`는 `ekf_filter_node` 등 다른 노드도 같이 쓰는 공용 버스라서다. `level`은 `OK`/`WARN`/`ERROR`/`STALE`/`UNKNOWN` 중 하나. `vision_node`가 카메라 프레임을 한 번도 못 받았을 때(`frame_age_s`가 원본 메시지에서 문자열 `"unknown"`인 경우) 세 숫자 필드는 전부 `null`로 relay된다 — 값이 느린 게 아니라 아예 안 들어온 것과, 느리게 들어오는 것(STALE)을 구분하기 위함이다(2026-08-29 카메라 프레임 미수신 사례).
 
-배터리/드라이브/센서 MCU/비전 카메라 상태 넷 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins).
+배터리/드라이브/센서 MCU/비전 카메라 상태 넷 다 `telemetry_relay_period_s`(기본 10초)마다, **클라이언트가 하나 이상 연결되어 있을 때만** 최신 값을 broadcast한다(버퍼링 없음, latest-wins). 링크가 약해지면 이 주기 자체가 `telemetry_relay_period_s_degraded`로 늘어난다 - 아래 `link_quality` 참고.
+
+**링크 품질 (link_quality) - 신규:**
+```json
+{
+  "kind": "link_quality",
+  "tier": "degraded",
+  "rtt_ms": 612.4,
+  "message": "통신 품질 저하 - 텔레메트리 갱신 주기와 비전 인식 해상도를 낮췄습니다"
+}
+```
+`link_quality_check_period_s`(기본 2초)마다 연결된 웹 클라이언트에 WebSocket ping을 보내 RTT를 측정한다(websockets 라이브러리 자체의 keepalive ping과는 별개 - 그건 연결이 죽었는지만 감지하고 RTT는 안 알려준다). `link_rtt_degraded_ms`(기본 800ms)를 `link_quality_hysteresis_checks`(기본 2회) 연속으로 넘기면 `degraded`로 전환하면서 `scout_vision`에 `LINK_QUALITY_PROFILES['degraded']`(`comm_relay_node.py`) 값을 자동으로 밀어넣는다 - `max_fps`를 낮추고 `/vision/snapshots`의 크롭·풀프레임 이미지를 더 작고 낮은 품질로 인코딩하게 한다. `link_rtt_good_ms`(기본 250ms) 밑으로 같은 횟수만큼 연속 회복하면 `good` 프로필(원래 값)로 되돌린다. 두 임계값 사이(250~800ms)는 "데드존"이라 티어가 바뀌지 않는다 - 경계값 근처에서 매번 왔다갔다(flapping)하는 걸 막기 위함. 웹 클라이언트가 하나도 없으면 측정 자체를 건너뛰고, 마지막 클라이언트가 끊기는 순간 티어는 조용히 `good`으로 리셋된다(다음 접속자는 항상 정상 화질로 시작해서 새로 측정됨).
+
+`ros2 topic echo /relay/link_status`(아래 `status` 프레임과는 별개의 ROS 토픽)에도 `quality_tier`/`quality_rtt_ms` 필드로 같이 노출되니, 웹 클라이언트 없이도 SSH로 현재 티어를 확인할 수 있다.
 
 **미션 상태 (mission_status):**
 ```json
@@ -280,6 +293,10 @@ ws.send(JSON.stringify({ kind: "command", command: "estop" }));
 | `return_home_status_topic` | `/return_home/status` | 구독할 복귀 상태 토픽 (`std_msgs/String` JSON, latched) |
 | `explore_cmd_vel_topic` | `/cmd_vel` | `stop_mission`(explore)에서 0속도 `Twist`를 발행할 토픽 |
 | `navigate_action` | `/navigate_to_pose` | `stop_mission`(explore)에서 진행 중인 goal을 취소할 때 쓰는 NavigateToPose action 이름 |
+| `link_quality_check_period_s` | `2.0` | 웹 클라이언트 ping RTT 측정 주기 |
+| `link_rtt_good_ms` / `link_rtt_degraded_ms` | `250.0` / `800.0` | `good`/`degraded` 티어 전환 임계값 (사이는 데드존) |
+| `link_quality_hysteresis_checks` | `2` | 티어를 실제로 전환하기까지 필요한 연속 확인 횟수 |
+| `telemetry_relay_period_s_degraded` | `15.0` | `degraded` 티어일 때의 `telemetry_relay_period_s` |
 
 ## 빌드 & 실행
 

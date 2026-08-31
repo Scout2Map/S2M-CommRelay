@@ -53,6 +53,15 @@ SETTABLE_PARAMS = {
         'confidence_threshold': {'type': 'double', 'min': 0.05, 'max': 0.95},
         'nms_threshold': {'type': 'double', 'min': 0.05, 'max': 0.95},
         'max_fps': {'type': 'double', 'min': 0.5, 'max': 15.0},
+        # Snapshot quality knobs - also the levers _apply_link_quality_profile()
+        # pulls automatically when the web link degrades (see
+        # LINK_QUALITY_PROFILES below), so a human's manual edit in the
+        # settings panel and the auto-adjust logic go through the exact
+        # same validated path.
+        'snapshot_max_size': {'type': 'integer', 'min': 32, 'max': 256},
+        'snapshot_jpeg_quality': {'type': 'integer', 'min': 10, 'max': 95},
+        'snapshot_full_frame_max_width': {'type': 'integer', 'min': 160, 'max': 640},
+        'snapshot_full_frame_jpeg_quality': {'type': 'integer', 'min': 10, 'max': 95},
     },
     'event_engine': {
         'event_repeat_interval_s': {'type': 'double', 'min': 1.0, 'max': 120.0},
@@ -62,6 +71,35 @@ SETTABLE_PARAMS = {
         'prediction_event_cooldown_s': {'type': 'double', 'min': 1.0, 'max': 300.0},
         'publish_clear_events': {'type': 'bool'},
     },
+}
+
+
+# Values _apply_link_quality_profile() pushes to scout_vision when the
+# measured web-client round-trip time crosses link_rtt_good_ms /
+# link_rtt_degraded_ms (see _check_link_quality / _update_link_quality_tier
+# below). Every key here must also exist in SETTABLE_PARAMS['scout_vision']
+# above so the auto-adjust logic goes through the same bounds-checked
+# _set_node_param() path a human editing the settings panel would use.
+LINK_QUALITY_PROFILES = {
+    'good': {
+        'max_fps': 5.0,
+        'snapshot_max_size': 128,
+        'snapshot_jpeg_quality': 60,
+        'snapshot_full_frame_max_width': 480,
+        'snapshot_full_frame_jpeg_quality': 55,
+    },
+    'degraded': {
+        'max_fps': 2.0,
+        'snapshot_max_size': 64,
+        'snapshot_jpeg_quality': 35,
+        'snapshot_full_frame_max_width': 240,
+        'snapshot_full_frame_jpeg_quality': 35,
+    },
+}
+
+_LINK_QUALITY_MESSAGES = {
+    'degraded': '통신 품질 저하 - 텔레메트리 갱신 주기와 비전 인식 해상도를 낮췄습니다',
+    'good': '통신 상태 양호 - 정상 해상도와 주기로 복원했습니다',
 }
 
 
@@ -115,6 +153,25 @@ class CommRelayNode(Node):
         self.declare_parameter('battery_topic', '/drive/battery')
         self.declare_parameter('drive_status_topic', '/drive/status')
         self.declare_parameter('telemetry_relay_period_s', 5.0)
+
+        # Link-quality auto-adjust: periodically pings the connected web
+        # client(s) and measures round-trip time on top of the websockets
+        # library's own keepalive ping (see ws_ping_interval_s/timeout_s
+        # above - that one only detects a dead connection, it does not
+        # expose RTT). Crossing link_rtt_degraded_ms for
+        # link_quality_hysteresis_checks consecutive checks pushes the
+        # 'degraded' LINK_QUALITY_PROFILES entry to scout_vision (lower
+        # max_fps + smaller/lower-quality snapshots) and stretches this
+        # node's own telemetry broadcast period; dropping back under
+        # link_rtt_good_ms for the same number of checks restores 'good'.
+        # The two thresholds are deliberately apart (not one toggle value)
+        # so a link hovering near a single cutoff does not flap the tier
+        # every check.
+        self.declare_parameter('link_quality_check_period_s', 2.0)
+        self.declare_parameter('link_rtt_good_ms', 250.0)
+        self.declare_parameter('link_rtt_degraded_ms', 800.0)
+        self.declare_parameter('link_quality_hysteresis_checks', 2)
+        self.declare_parameter('telemetry_relay_period_s_degraded', 15.0)
 
         # Pico sensor-fusion MCU link/presence, published by sensor_bridge.
         # Surfaced the same way as drive_status so an operator sees a dead
@@ -189,6 +246,8 @@ class CommRelayNode(Node):
         self._battery_topic = self.get_parameter('battery_topic').value
         self._drive_status_topic = self.get_parameter('drive_status_topic').value
         self._telemetry_relay_period_s = float(self.get_parameter('telemetry_relay_period_s').value)
+        self._telemetry_relay_period_s_degraded = float(
+            self.get_parameter('telemetry_relay_period_s_degraded').value)
         self._sensor_status_topic = self.get_parameter('sensor_status_topic').value
         self._diagnostics_topic = self.get_parameter('diagnostics_topic').value
         self._vision_diagnostic_name = self.get_parameter(
@@ -208,11 +267,35 @@ class CommRelayNode(Node):
             'event_engine': self.get_parameter('event_engine_node_name').value,
         }
 
+        self._link_quality_check_period_s = float(
+            self.get_parameter('link_quality_check_period_s').value)
+        self._link_rtt_good_ms = float(self.get_parameter('link_rtt_good_ms').value)
+        self._link_rtt_degraded_ms = float(
+            self.get_parameter('link_rtt_degraded_ms').value)
+        self._link_quality_hysteresis_checks = max(1, int(
+            self.get_parameter('link_quality_hysteresis_checks').value))
+
+        # Guarded by self._buffer_lock alongside _link_state/_ws_clients -
+        # conceptually the same "is the web link okay" state, and reusing
+        # the lock avoids adding yet another one just for these three ints.
+        self._link_quality_tier = 'good'
+        self._link_quality_pending = None
+        self._link_quality_streak = 0
+        self._link_last_rtt_ms = None
+
         self._telemetry_lock = threading.Lock()
         self._latest_battery_payload = None
         self._latest_drive_status_payload = None
         self._latest_sensor_status_payload = None
         self._latest_vision_status_payload = None
+        # _broadcast_telemetry() fires every telemetry_relay_period_s tick
+        # (the 'good'/base period) but only actually sends every
+        # _telemetry_skip_every-th tick - stretching the effective period
+        # under a degraded link without touching the underlying rclpy
+        # Timer object from the asyncio thread. Recomputed by
+        # _apply_link_quality_profile() on every tier change.
+        self._telemetry_tick = 0
+        self._telemetry_skip_every = 1
 
         # Cached so a client that connects after the last publish (both
         # topics are latched, but that only guarantees comm_relay's own
@@ -352,6 +435,10 @@ class CommRelayNode(Node):
             self._pose_relay_period_s, self._broadcast_robot_pose)
         self._telemetry_timer = self.create_timer(
             self._telemetry_relay_period_s, self._broadcast_telemetry)
+        # Fires on the executor thread and just schedules the actual ping
+        # round-trip onto the asyncio loop - see _check_link_quality_tick.
+        self._link_quality_timer = self.create_timer(
+            self._link_quality_check_period_s, self._check_link_quality_tick)
 
         # The websocket server runs its own asyncio loop on a background
         # thread so it never blocks rclpy.spin() on the main thread.
@@ -455,12 +542,24 @@ class CommRelayNode(Node):
         except Exception as exc:  # noqa: BLE001 - one bad client must not kill the server
             self.get_logger().warning(f'client session ended with error: {exc}')
         finally:
+            reset_quality = False
             with self._buffer_lock:
                 self._ws_clients.discard(websocket)
                 self._client_locks.pop(websocket, None)
                 if not self._ws_clients:
                     self._last_client_seen_mono = time.monotonic()
                     self._link_state = 'lost'
+                    # No client left to measure or adapt for - snap the
+                    # tier back to 'good' so a fresh connection always
+                    # starts from full quality rather than whatever it was
+                    # last degraded to, and gets re-measured from scratch.
+                    reset_quality = self._link_quality_tier != 'good'
+                    self._link_quality_tier = 'good'
+                    self._link_quality_pending = None
+                    self._link_quality_streak = 0
+                    self._link_last_rtt_ms = None
+            if reset_quality:
+                self._apply_link_quality_profile('good')
 
     async def _handle_inbound_message(self, raw_msg, websocket=None):
         """Web UI로부터 들어온 command 수신 처리"""
@@ -776,6 +875,107 @@ class CommRelayNode(Node):
 
         future.add_done_callback(_on_set_done)
 
+    # --- link-quality auto-adjust (asyncio side) ---
+
+    def _check_link_quality_tick(self):
+        # rclpy timer callback (executor thread) - just hands off to the
+        # asyncio loop, same pattern as _broadcast_mission_status etc.
+        asyncio.run_coroutine_threadsafe(self._check_link_quality(), self._loop)
+
+    async def _check_link_quality(self):
+        with self._buffer_lock:
+            clients = list(self._ws_clients)
+        if not clients:
+            # Nobody to ping and nothing to adapt for. Deliberately left
+            # alone rather than reset here - the finally: block in
+            # _on_client() already snaps the tier back to 'good' the
+            # moment the last client disconnects, so there is nothing
+            # stale left to clear by the time this runs.
+            return
+
+        rtts_ms = []
+        for client in clients:
+            try:
+                started = time.monotonic()
+                pong_waiter = await client.ping()
+                await asyncio.wait_for(pong_waiter, timeout=self._ping_timeout_s)
+                rtts_ms.append((time.monotonic() - started) * 1000.0)
+            except (ConnectionClosed, asyncio.TimeoutError, OSError):
+                # A client that fails to pong at all is at least as bad as
+                # the worst possible measured RTT - timing it out rather
+                # than skipping it keeps one silently-dying client from
+                # hiding behind a healthy one in the max() below.
+                rtts_ms.append(self._ping_timeout_s * 1000.0)
+
+        if not rtts_ms:
+            return
+
+        # Worst client, not average - on a shared AP one weak client is
+        # reason enough to degrade the feed for everyone.
+        rtt_ms = max(rtts_ms)
+        with self._buffer_lock:
+            self._link_last_rtt_ms = rtt_ms
+        self._update_link_quality_tier(rtt_ms)
+
+    def _update_link_quality_tier(self, rtt_ms):
+        if rtt_ms >= self._link_rtt_degraded_ms:
+            candidate = 'degraded'
+        elif rtt_ms <= self._link_rtt_good_ms:
+            candidate = 'good'
+        else:
+            candidate = None  # dead zone between the two thresholds - hold
+
+        with self._buffer_lock:
+            current = self._link_quality_tier
+            if candidate is None or candidate == current:
+                self._link_quality_pending = None
+                self._link_quality_streak = 0
+                return
+
+            if candidate != self._link_quality_pending:
+                self._link_quality_pending = candidate
+                self._link_quality_streak = 1
+            else:
+                self._link_quality_streak += 1
+
+            if self._link_quality_streak < self._link_quality_hysteresis_checks:
+                return
+
+            self._link_quality_tier = candidate
+            self._link_quality_pending = None
+            self._link_quality_streak = 0
+
+        self.get_logger().info(
+            f'link quality -> {candidate} (rtt={rtt_ms:.0f}ms)')
+        self._apply_link_quality_profile(candidate)
+        self._broadcast_link_quality(candidate, rtt_ms)
+
+    def _apply_link_quality_profile(self, tier):
+        """Pushes LINK_QUALITY_PROFILES[tier] to scout_vision and stretches
+        this node's own telemetry broadcast period, all through the same
+        bounds-checked path a human using the settings panel would use."""
+        for param_name, value in LINK_QUALITY_PROFILES[tier].items():
+            self._set_node_param('scout_vision', param_name, value)
+
+        if tier == 'degraded':
+            skip_every = max(1, round(
+                self._telemetry_relay_period_s_degraded
+                / self._telemetry_relay_period_s))
+        else:
+            skip_every = 1
+        with self._telemetry_lock:
+            self._telemetry_skip_every = skip_every
+            self._telemetry_tick = 0
+
+    def _broadcast_link_quality(self, tier, rtt_ms):
+        payload = json.dumps({
+            'kind': 'link_quality',
+            'tier': tier,
+            'rtt_ms': round(rtt_ms, 1),
+            'message': _LINK_QUALITY_MESSAGES.get(tier, tier),
+        })
+        asyncio.run_coroutine_threadsafe(self._broadcast(payload), self._loop)
+
     def _fetch_and_broadcast_settings(self, target=None):
         """Fetches current thresholds + every SETTABLE_PARAMS value, then
         sends one 'settings' envelope - to just `target` when a single
@@ -1046,12 +1246,23 @@ class CommRelayNode(Node):
             pass
         
     def _broadcast_telemetry(self):
-        """설정한 주기마다 최신 배터리 및 드라이브 상태를 주기적으로 브로드캐스트"""
+        """설정한 주기마다 최신 배터리 및 드라이브 상태를 주기적으로 브로드캐스트
+
+        On a degraded link _apply_link_quality_profile() raises
+        _telemetry_skip_every above 1 to stretch the effective period
+        without touching the underlying rclpy Timer - most ticks return
+        here without reading (let alone clearing) the cached payloads, so
+        whatever arrives while a tick is skipped is still there, still the
+        latest value, on the tick that actually sends.
+        """
         with self._buffer_lock:
             if not self._ws_clients:
                 return
 
         with self._telemetry_lock:
+            self._telemetry_tick += 1
+            if self._telemetry_tick % self._telemetry_skip_every != 0:
+                return
             batt_payload = self._latest_battery_payload
             status_payload = self._latest_drive_status_payload
             sensor_payload = self._latest_sensor_status_payload
@@ -1224,6 +1435,11 @@ class CommRelayNode(Node):
                 if state == 'lost' and self._last_client_seen_mono is not None
                 else 0.0
             )
+            quality_tier = self._link_quality_tier
+            quality_rtt_ms = (
+                round(self._link_last_rtt_ms, 1)
+                if self._link_last_rtt_ms is not None else None
+            )
 
         payload = {
             'state': state,
@@ -1231,6 +1447,11 @@ class CommRelayNode(Node):
             'buffered_count': buffered,
             'dropped_count': dropped,
             'offline_s': offline_s,
+            # link-quality auto-adjust (see _check_link_quality) - exposed
+            # here too so `ros2 topic echo /relay/link_status` shows it
+            # without needing a web client connected.
+            'quality_tier': quality_tier,
+            'quality_rtt_ms': quality_rtt_ms,
         }
         self._status_pub.publish(String(data=json.dumps(payload)))
 
